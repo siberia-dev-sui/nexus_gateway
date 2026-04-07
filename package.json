@@ -1,0 +1,17 @@
+{
+  "name": "nexus-gateway",
+  "version": "1.0.0",
+  "description": "NEXUS API Gateway — Leiros field sales platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^8.5.0",
+    "@fastify/jwt": "^8.0.1",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.29.1"
+  }
+}
