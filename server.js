@@ -100,12 +100,16 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
   const products = await odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_1920', '!=', false]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 500 }
+    [[['sale_ok', '=', true], ['active', '=', true]]],
+    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_1920'], limit: 500, context: { bin_size: true } }
   )
-  _catalogCache = products
+  // Filter to only products with image, then strip image_1920 from response
+  const withImage = products
+    .filter(p => p.image_1920)
+    .map(({ image_1920, ...p }) => p)
+  _catalogCache = withImage
   _catalogCacheTime = now
-  return { status: 'ok', count: products.length, products, cached: false }
+  return { status: 'ok', count: withImage.length, products: withImage, cached: false }
 })
 
 // Proxy de imagen con re-auth automático
@@ -158,11 +162,14 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_1920', '!=', false]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 500 }
+    [[['sale_ok', '=', true], ['active', '=', true]]],
+    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_1920'], limit: 500, context: { bin_size: true } }
   ).then(products => {
-    _catalogCache = products
+    const withImage = products
+      .filter(p => p.image_1920)
+      .map(({ image_1920, ...p }) => p)
+    _catalogCache = withImage
     _catalogCacheTime = Date.now()
-    fastify.log.info(`Catalog cache warmed: ${products.length} products`)
+    fastify.log.info(`Catalog cache warmed: ${withImage.length} products with image`)
   }).catch(e => fastify.log.warn('Warm-up failed:', e.message))
 })
