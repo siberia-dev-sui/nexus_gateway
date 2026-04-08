@@ -149,9 +149,20 @@ fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async (reques
 // --- Start ---
 const PORT = process.env.PORT || 3000
 
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   if (err) {
     fastify.log.error(err)
     process.exit(1)
   }
+  // Warm up cache on startup — don't block server
+  odooCall(
+    'product.product',
+    'search_read',
+    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', 'not in', [false]]]],
+    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 200 }
+  ).then(products => {
+    _catalogCache = products
+    _catalogCacheTime = Date.now()
+    fastify.log.info(`Catalog cache warmed: ${products.length} products`)
+  }).catch(e => fastify.log.warn('Warm-up failed:', e.message))
 })
