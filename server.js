@@ -88,6 +88,7 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
 })
 
 // Catálogo público — caché en memoria 1h para no saturar Odoo
+// Las imágenes se sirven por URL lazy (no base64 en bulk)
 let _catalogCache = null
 let _catalogCacheTime = null
 const CATALOG_TTL_MS = 60 * 60 * 1000 // 1 hora
@@ -101,16 +102,22 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
   const products = await odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', '!=', false]]],
+    [[['sale_ok', '=', true], ['active', '=', true]]],
     {
-      fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_128'],
+      fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'],
       limit: 200
     }
   )
 
-  _catalogCache = products
+  // Agrega URL de imagen por producto — Flutter la carga lazy sin saturar Odoo
+  const withImages = products.map(p => ({
+    ...p,
+    image_url: `${process.env.ODOO_URL}/web/image/product.product/${p.id}/image_128`
+  }))
+
+  _catalogCache = withImages
   _catalogCacheTime = now
-  return { status: 'ok', count: products.length, products, cached: false }
+  return { status: 'ok', count: withImages.length, products: withImages, cached: false }
 })
 
 // Sync inicial — productos reales de Odoo (protegido)
