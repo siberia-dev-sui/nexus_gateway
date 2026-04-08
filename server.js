@@ -95,7 +95,7 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
     [[['sale_ok', '=', true], ['active', '=', true], ['image_128', '!=', false]]],
     {
       fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_128'],
-      limit: 50
+      limit: 200
     }
   )
   return { status: 'ok', count: products.length, products }
