@@ -92,24 +92,35 @@ let _catalogCache = null
 let _catalogCacheTime = null
 const CATALOG_TTL_MS = 60 * 60 * 1000
 
+async function fetchCatalogFromOdoo() {
+  // Step 1: get IDs of products that have an image (via ir.attachment — fast index scan)
+  const attachments = await odooCall(
+    'ir.attachment',
+    'search_read',
+    [[['res_model', 'in', ['product.product', 'product.template']], ['res_field', 'in', ['image_1920', 'image_128']]]],
+    { fields: ['res_id'], limit: 2000 }
+  )
+  const idsWithImage = [...new Set(attachments.map(a => a.res_id).filter(Boolean))]
+
+  // Step 2: fetch products filtered by those IDs — instant because id IN [...] is indexed
+  const products = await odooCall(
+    'product.product',
+    'search_read',
+    [[['sale_ok', '=', true], ['active', '=', true], ['id', 'in', idsWithImage]]],
+    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 500 }
+  )
+  return products
+}
+
 fastify.get('/api/v1/catalog', async (request, reply) => {
   const now = Date.now()
   if (_catalogCache && _catalogCacheTime && (now - _catalogCacheTime) < CATALOG_TTL_MS) {
     return { status: 'ok', count: _catalogCache.length, products: _catalogCache, cached: true }
   }
-  const products = await odooCall(
-    'product.product',
-    'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_1920'], limit: 500, context: { bin_size: true } }
-  )
-  // Filter to only products with image, then strip image_1920 from response
-  const withImage = products
-    .filter(p => p.image_1920)
-    .map(({ image_1920, ...p }) => p)
-  _catalogCache = withImage
+  const products = await fetchCatalogFromOdoo()
+  _catalogCache = products
   _catalogCacheTime = now
-  return { status: 'ok', count: withImage.length, products: withImage, cached: false }
+  return { status: 'ok', count: products.length, products, cached: false }
 })
 
 // Proxy de imagen con re-auth automático
@@ -159,17 +170,9 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     process.exit(1)
   }
   // Warm up cache on startup — don't block server
-  odooCall(
-    'product.product',
-    'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_1920'], limit: 500, context: { bin_size: true } }
-  ).then(products => {
-    const withImage = products
-      .filter(p => p.image_1920)
-      .map(({ image_1920, ...p }) => p)
-    _catalogCache = withImage
+  fetchCatalogFromOdoo().then(products => {
+    _catalogCache = products
     _catalogCacheTime = Date.now()
-    fastify.log.info(`Catalog cache warmed: ${withImage.length} products with image`)
+    fastify.log.info(`Catalog cache warmed: ${products.length} products with image`)
   }).catch(e => fastify.log.warn('Warm-up failed:', e.message))
 })
