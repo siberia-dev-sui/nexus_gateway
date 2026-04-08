@@ -100,7 +100,7 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
   const products = await odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', '!=', false]]],
+    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', 'not in', [false]]]],
     { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 200 }
   )
   _catalogCache = products
