@@ -87,14 +87,14 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
   reply.code(401).send({ error: 'Invalid credentials' })
 })
 
-// Catálogo público — para demo sin login
+// Catálogo público — para demo sin login (solo productos con imagen)
 fastify.get('/api/v1/catalog', async (request, reply) => {
   const products = await odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true]]],
+    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', '!=', false]]],
     {
-      fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'],
+      fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_128'],
       limit: 50
     }
   )
