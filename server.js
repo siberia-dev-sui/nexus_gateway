@@ -126,7 +126,7 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
 // Proxy de imagen con re-auth automático
 fastify.get('/api/v1/product/:id/image', async (request, reply) => {
   if (!odooSession) await odooAuth()
-  const url = `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_128`
+  const url = `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_256`
   try {
     let res = await axios.get(url, { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' })
     if (res.status === 403 || res.status === 302) {
