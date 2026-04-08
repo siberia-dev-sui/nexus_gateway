@@ -87,8 +87,17 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
   reply.code(401).send({ error: 'Invalid credentials' })
 })
 
-// Catálogo público — para demo sin login (solo productos con imagen)
+// Catálogo público — caché en memoria 1h para no saturar Odoo
+let _catalogCache = null
+let _catalogCacheTime = null
+const CATALOG_TTL_MS = 60 * 60 * 1000 // 1 hora
+
 fastify.get('/api/v1/catalog', async (request, reply) => {
+  const now = Date.now()
+  if (_catalogCache && _catalogCacheTime && (now - _catalogCacheTime) < CATALOG_TTL_MS) {
+    return { status: 'ok', count: _catalogCache.length, products: _catalogCache, cached: true }
+  }
+
   const products = await odooCall(
     'product.product',
     'search_read',
@@ -98,7 +107,10 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
       limit: 200
     }
   )
-  return { status: 'ok', count: products.length, products }
+
+  _catalogCache = products
+  _catalogCacheTime = now
+  return { status: 'ok', count: products.length, products, cached: false }
 })
 
 // Sync inicial — productos reales de Odoo (protegido)
