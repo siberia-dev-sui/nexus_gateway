@@ -109,15 +109,31 @@ fastify.get('/api/v1/catalog', async (request, reply) => {
     }
   )
 
-  // Agrega URL de imagen por producto — Flutter la carga lazy sin saturar Odoo
+  // Agrega URL de imagen por producto — pasa por el gateway (tiene auth con Odoo)
   const withImages = products.map(p => ({
     ...p,
-    image_url: `${process.env.ODOO_URL}/web/image/product.product/${p.id}/image_128`
+    image_url: `/api/v1/product/${p.id}/image`
   }))
 
   _catalogCache = withImages
   _catalogCacheTime = now
   return { status: 'ok', count: withImages.length, products: withImages, cached: false }
+})
+
+// Proxy de imagen — Flutter no puede autenticarse con Odoo, el gateway lo hace
+fastify.get('/api/v1/product/:id/image', async (request, reply) => {
+  if (!odooSession) await odooAuth()
+  try {
+    const res = await axios.get(
+      `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_128`,
+      { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' }
+    )
+    reply.header('Content-Type', res.headers['content-type'] || 'image/png')
+    reply.header('Cache-Control', 'public, max-age=3600')
+    return reply.send(Buffer.from(res.data))
+  } catch {
+    reply.code(404).send()
+  }
 })
 
 // Sync inicial — productos reales de Odoo (protegido)
