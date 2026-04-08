@@ -87,31 +87,44 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
   reply.code(401).send({ error: 'Invalid credentials' })
 })
 
-// Catálogo paginado — base64 por página, 20 productos c/u (~300KB), caché 1h
-const _pageCache = new Map()
+// Catálogo público — solo texto, caché 1h
+let _catalogCache = null
+let _catalogCacheTime = null
 const CATALOG_TTL_MS = 60 * 60 * 1000
 
 fastify.get('/api/v1/catalog', async (request, reply) => {
-  const page   = Math.max(1, parseInt(request.query.page)  || 1)
-  const limit  = Math.min(50, parseInt(request.query.limit) || 20)
-  const offset = (page - 1) * limit
-  const cacheKey = `${page}_${limit}`
   const now = Date.now()
-
-  const cached = _pageCache.get(cacheKey)
-  if (cached && (now - cached.time) < CATALOG_TTL_MS) {
-    return { status: 'ok', page, limit, count: cached.products.length, products: cached.products, cached: true }
+  if (_catalogCache && _catalogCacheTime && (now - _catalogCacheTime) < CATALOG_TTL_MS) {
+    return { status: 'ok', count: _catalogCache.length, products: _catalogCache, cached: true }
   }
-
   const products = await odooCall(
     'product.product',
     'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_128', '!=', false]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code', 'image_128'], limit, offset }
+    [[['sale_ok', '=', true], ['active', '=', true]]],
+    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 200 }
   )
+  _catalogCache = products
+  _catalogCacheTime = now
+  return { status: 'ok', count: products.length, products, cached: false }
+})
 
-  _pageCache.set(cacheKey, { products, time: now })
-  return { status: 'ok', page, limit, count: products.length, products, cached: false }
+// Proxy de imagen con re-auth automático
+fastify.get('/api/v1/product/:id/image', async (request, reply) => {
+  if (!odooSession) await odooAuth()
+  const url = `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_128`
+  try {
+    let res = await axios.get(url, { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' })
+    if (res.status === 403 || res.status === 302) {
+      odooSession = null
+      await odooAuth()
+      res = await axios.get(url, { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' })
+    }
+    reply.header('Content-Type', res.headers['content-type'] || 'image/png')
+    reply.header('Cache-Control', 'public, max-age=86400')
+    return reply.send(Buffer.from(res.data))
+  } catch {
+    reply.code(404).send()
+  }
 })
 
 // Sync inicial — productos reales de Odoo (protegido)
