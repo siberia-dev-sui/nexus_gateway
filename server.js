@@ -142,17 +142,15 @@ fastify.get('/api/v1/product/:id/image', async (request, reply) => {
   }
 })
 
-// Sync inicial — productos reales de Odoo (protegido)
+// Sync inicial — misma lógica que /catalog pero protegido con JWT
 fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async (request, reply) => {
-  const products = await odooCall(
-    'product.product',
-    'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['image_1920', '!=', false]]],
-    {
-      fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'],
-      limit: 200
-    }
-  )
+  // Use cache if available
+  if (_catalogCache && _catalogCacheTime && (Date.now() - _catalogCacheTime) < CATALOG_TTL_MS) {
+    return { status: 'ok', count: _catalogCache.length, products: _catalogCache, cached: true }
+  }
+  const products = await fetchCatalogFromOdoo()
+  _catalogCache = products
+  _catalogCacheTime = Date.now()
 
   return {
     status: 'ok',
