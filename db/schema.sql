@@ -13,6 +13,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- para gen_random_uuid()
 CREATE TABLE IF NOT EXISTS vendedores (
   id              SERIAL PRIMARY KEY,
   uuid            UUID DEFAULT gen_random_uuid() UNIQUE NOT NULL,
+  odoo_vendor_id  INTEGER,                              -- nexus.vendor.id en Odoo (se llena en sync)
   nombre          TEXT NOT NULL,
   email           TEXT UNIQUE NOT NULL,
   password_hash   TEXT NOT NULL,                        -- bcrypt
@@ -75,10 +76,12 @@ CREATE TABLE IF NOT EXISTS paradas (
   ruta_id         INTEGER REFERENCES rutas(id) ON DELETE CASCADE,
   cliente_id      INTEGER REFERENCES clientes(odoo_id),
   orden           INTEGER NOT NULL,                     -- secuencia del día
+  orden_actual    INTEGER,                              -- posición reordenada en tiempo real
   estado          TEXT DEFAULT 'pending',               -- pending | on_site | completed | skipped
   lat             NUMERIC(10,7),
   lng             NUMERIC(10,7),
-  notas           TEXT
+  notas           TEXT,
+  saltada_at      TIMESTAMPTZ                           -- se llena cuando estado = 'skipped'
 );
 
 -- ─────────────────────────────────────────

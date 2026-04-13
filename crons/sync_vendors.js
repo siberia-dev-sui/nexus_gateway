@@ -5,79 +5,87 @@ const { query } = require('../db')
 // Cron: sync vendedores desde Odoo → PostgreSQL
 // Frecuencia: cada 1 hora
 //
-// Odoo es la fuente de verdad de los empleados.
-// Este cron jala hr.employee donde es_vendedor_nexus = true
-// y mantiene la tabla vendedores sincronizada.
+// Odoo (nexus.vendor) es la fuente de verdad de los vendedores.
+// El link entre ambas tablas es:
+//   vendedores.uuid  ←→  nexus.vendor.nexus_uuid
 //
-// Lenn debe agregar en hr.employee:
-//   - es_vendedor_nexus (Boolean)
-//   - nexus_zona        (Char)
+// Flujo:
+//   1. Admin crea el vendedor en Odoo → nexus_uuid se autogenera
+//   2. Este cron lo replica a PostgreSQL con ese mismo UUID
+//   3. El vendedor inicia sesión en la app con email + password temporal
 // ─────────────────────────────────────────
 
 async function syncVendors(odooCall) {
-  console.log('[SYNC_VENDORS] Iniciando sync desde Odoo...')
+  console.log('[SYNC_VENDORS] Iniciando sync desde nexus.vendor en Odoo...')
 
-  let empleados = []
+  let vendors = []
 
   try {
-    // Intentar con campo es_vendedor_nexus (requiere modulo nexus_field de Lenn)
-    empleados = await odooCall(
-      'hr.employee',
-      'search_read',
-      [[['es_vendedor_nexus', '=', true], ['active', '=', true]]],
-      { fields: ['id', 'name', 'work_email', 'nexus_zona'], limit: 200 }
-    )
-  } catch (err) {
-    // Si el campo no existe aun, jalar todos los empleados activos como fallback
-    console.warn('[SYNC_VENDORS] Campo es_vendedor_nexus no disponible en Odoo, usando fallback (todos los empleados activos)')
-    empleados = await odooCall(
-      'hr.employee',
+    vendors = await odooCall(
+      'nexus.vendor',
       'search_read',
       [[['active', '=', true]]],
-      { fields: ['id', 'name', 'work_email'], limit: 200 }
+      { fields: ['id', 'nexus_uuid', 'name', 'email', 'zone'], limit: 500 }
     )
+  } catch (err) {
+    console.error('[SYNC_VENDORS] Error al leer nexus.vendor desde Odoo:', err.message)
+    console.error('[SYNC_VENDORS] ¿Está instalado el módulo nexus_mobile en Odoo?')
+    return { creados: 0, actualizados: 0, desactivados: 0, errores: 1 }
   }
 
-  if (!empleados.length) {
-    console.log('[SYNC_VENDORS] No se encontraron empleados en Odoo')
+  if (!vendors.length) {
+    console.log('[SYNC_VENDORS] No se encontraron vendedores activos en Odoo')
     return { creados: 0, actualizados: 0, desactivados: 0 }
   }
 
-  console.log(`[SYNC_VENDORS] ${empleados.length} empleados encontrados en Odoo`)
+  console.log(`[SYNC_VENDORS] ${vendors.length} vendedor(es) encontrados en Odoo`)
 
   let creados = 0
   let actualizados = 0
 
-  for (const emp of empleados) {
-    // Ignorar empleados sin email — no pueden iniciar sesion en la app
-    if (!emp.work_email) {
-      console.warn(`[SYNC_VENDORS] Empleado ${emp.id} (${emp.name}) sin work_email — omitido`)
+  for (const v of vendors) {
+    // nexus_uuid es obligatorio — si falta, el vendedor no puede sincronizarse
+    if (!v.nexus_uuid) {
+      console.warn(`[SYNC_VENDORS] Vendedor ID=${v.id} (${v.name}) sin nexus_uuid — omitido`)
       continue
     }
 
-    const email = emp.work_email.toLowerCase().trim()
-    const zona  = emp.nexus_zona || null
+    // Email viene del partner asociado en Odoo (campo stored-related en nexus.vendor)
+    if (!v.email) {
+      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin email en su contacto Odoo — omitido`)
+      continue
+    }
 
-    // Buscar si ya existe por odoo_employee_id o por email
+    const email = v.email.toLowerCase().trim()
+    const zona  = v.zone || null
+
+    // Buscar por uuid (vínculo principal) o por email como fallback
     const existing = await query(
-      'SELECT id, nombre, email, zona, activo FROM vendedores WHERE odoo_employee_id = $1 OR email = $2',
-      [emp.id, email]
+      `SELECT id, nombre, email, zona, activo
+       FROM vendedores
+       WHERE uuid = $1 OR email = $2
+       LIMIT 1`,
+      [v.nexus_uuid, email]
     )
 
     if (existing.rows.length) {
-      // Actualizar datos si cambiaron
-      const v = existing.rows[0]
-      const cambios = v.nombre !== emp.name || v.email !== email || v.zona !== zona || !v.activo
+      const row = existing.rows[0]
+      const cambios = (
+        row.nombre !== v.name ||
+        row.email  !== email  ||
+        row.zona   !== zona   ||
+        !row.activo
+      )
 
       if (cambios) {
         await query(
           `UPDATE vendedores
            SET nombre = $1, email = $2, zona = $3, activo = true,
-               odoo_employee_id = $4
-           WHERE id = $5`,
-          [emp.name, email, zona, emp.id, v.id]
+               uuid = $4, odoo_vendor_id = $5
+           WHERE id = $6`,
+          [v.name, email, zona, v.nexus_uuid, v.id, row.id]
         )
-        console.log(`[SYNC_VENDORS] Actualizado: ${emp.name} (${email})`)
+        console.log(`[SYNC_VENDORS] Actualizado: ${v.name} (${email})`)
         actualizados++
       }
     } else {
@@ -86,36 +94,38 @@ async function syncVendors(odooCall) {
       const hash = await bcrypt.hash(passwordTemporal, 10)
 
       await query(
-        `INSERT INTO vendedores (nombre, email, password_hash, zona, odoo_employee_id, activo)
-         VALUES ($1, $2, $3, $4, $5, true)`,
-        [emp.name, email, hash, zona, emp.id]
+        `INSERT INTO vendedores (uuid, odoo_vendor_id, nombre, email, password_hash, zona, activo)
+         VALUES ($1, $2, $3, $4, $5, $6, true)`,
+        [v.nexus_uuid, v.id, v.name, email, hash, zona]
       )
 
-      // Loguear la password temporal para que el admin la distribuya
-      // TODO: reemplazar con envio por email/SMS cuando este disponible
-      console.log(`[SYNC_VENDORS] Creado: ${emp.name} (${email}) — password temporal: ${passwordTemporal}`)
+      // Password temporal — el admin la distribuye al vendedor
+      // TODO: reemplazar con envío por email/WhatsApp cuando esté disponible
+      console.log(`[SYNC_VENDORS] Creado: ${v.name} (${email}) — password temporal: ${passwordTemporal}`)
       creados++
     }
   }
 
-  // Desactivar vendedores que ya no estan en Odoo como nexus_vendors
-  // Solo si el campo es_vendedor_nexus existe (no en fallback)
-  const odooIds = empleados.map(e => e.id)
-  if (odooIds.length) {
-    const desactivados = await query(
+  // Desactivar vendedores que ya no están activos en Odoo
+  const activeUuids = vendors
+    .filter(v => v.nexus_uuid)
+    .map(v => v.nexus_uuid)
+
+  if (activeUuids.length) {
+    const result = await query(
       `UPDATE vendedores
        SET activo = false
-       WHERE odoo_employee_id IS NOT NULL
-         AND odoo_employee_id != ALL($1::int[])
+       WHERE uuid IS NOT NULL
+         AND uuid != ALL($1::uuid[])
          AND activo = true
        RETURNING nombre, email`,
-      [odooIds]
+      [activeUuids]
     )
-    if (desactivados.rows.length) {
-      desactivados.rows.forEach(v => {
-        console.log(`[SYNC_VENDORS] Desactivado: ${v.nombre} (${v.email}) — ya no esta en Odoo`)
+    if (result.rows.length) {
+      result.rows.forEach(row => {
+        console.log(`[SYNC_VENDORS] Desactivado: ${row.nombre} (${row.email}) — ya no está en Odoo`)
       })
-      return { creados, actualizados, desactivados: desactivados.rows.length }
+      return { creados, actualizados, desactivados: result.rows.length }
     }
   }
 
@@ -123,7 +133,7 @@ async function syncVendors(odooCall) {
   return { creados, actualizados, desactivados: 0 }
 }
 
-// Password temporal: 8 caracteres, letras + numeros
+// Password temporal: 8 caracteres alfanuméricos sin ambiguos
 function generarPassword() {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
   let pass = ''
