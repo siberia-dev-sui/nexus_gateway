@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="nexus_map_template">
+        <div id="nexus_map_root"/>
+    </template>
+</odoo>
