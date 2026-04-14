@@ -53,6 +53,28 @@ async function odooCall(model, method, args = [], kwargs = {}) {
   }
 }
 
+// Helper para endpoints custom del módulo nexus_mobile
+// Mismo patrón de re-auth que odooCall — maneja sesión expirada automáticamente
+async function odooPost(path, params = {}) {
+  if (!odooSession) await odooAuth()
+  try {
+    const res = await axios.post(
+      `${process.env.ODOO_URL}${path}`,
+      { jsonrpc: '2.0', method: 'call', params },
+      { headers: { Cookie: odooSession.join('; ') } }
+    )
+    if (res.data.error) {
+      odooSession = null
+      await odooAuth()
+      return odooPost(path, params)  // reintento una vez
+    }
+    return res.data.result
+  } catch (err) {
+    odooSession = null
+    throw err
+  }
+}
+
 // ─────────────────────────────────────────
 // Plugins
 // ─────────────────────────────────────────
@@ -73,20 +95,12 @@ async function verifyToken(request, reply) {
 const CATALOG_TTL_SEC = 60 * 60 // 1 hora
 
 async function fetchCatalogFromOdoo() {
-  const attachments = await odooCall(
-    'ir.attachment',
-    'search_read',
-    [[['res_model', 'in', ['product.product', 'product.template']], ['res_field', 'in', ['image_1920', 'image_128']]]],
-    { fields: ['res_id'], limit: 2000 }
-  )
-  const idsWithImage = [...new Set(attachments.map(a => a.res_id).filter(Boolean))]
-  const products = await odooCall(
-    'product.product',
-    'search_read',
-    [[['sale_ok', '=', true], ['active', '=', true], ['id', 'in', idsWithImage]]],
-    { fields: ['name', 'list_price', 'qty_available', 'categ_id', 'default_code'], limit: 500 }
-  )
-  return products
+  // Delega al controller del módulo nexus_mobile — encapsula la lógica
+  // de ir.attachment + product.product en un solo endpoint controlado por Odoo.
+  // Shape de respuesta idéntico al anterior: id, name, list_price,
+  // qty_available, categ_id, default_code
+  const result = await odooPost('/nexus/api/v1/catalog')
+  return result.products
 }
 
 async function getCatalog() {
@@ -459,6 +473,20 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   // Inyectar odooCall al worker de BullMQ
   setOdooCall(odooCall)
   fastify.log.info('[BullMQ] Worker iniciado — procesando cola nexus:outbox')
+
+  // ── Health check del módulo nexus_mobile ─────────────
+  // Verifica que el módulo esté instalado en Odoo antes de arrancar los crons.
+  // odooPost maneja la autenticación — no depende de odooSession directamente.
+  try {
+    const h = await odooPost('/nexus/api/v1/health')
+    fastify.log.info(
+      `[NEXUS MODULE] ✅ ${h.module} v${h.version} — ${h.vendor_count} vendedor(es) activo(s)`
+    )
+  } catch (e) {
+    fastify.log.warn(
+      `[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — instalar nexus_mobile en Odoo para activar sync`
+    )
+  }
 
   // Warm up catalog cache en Redis
   getCatalog().then(({ products, cached }) => {
