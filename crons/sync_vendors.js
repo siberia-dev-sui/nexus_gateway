@@ -29,7 +29,7 @@ async function syncVendors(odooCall) {
     )
   } catch (err) {
     console.error('[SYNC_VENDORS] Error al leer nexus.vendor desde Odoo:', err.message)
-    console.error('[SYNC_VENDORS] ¿Está instalado el módulo nexus_field en Odoo y tiene el modelo nexus.vendor?')
+    console.error('[SYNC_VENDORS] ¿Está instalado el módulo nexus_mobile en Odoo y tiene el modelo nexus.vendor?')
     return { creados: 0, actualizados: 0, desactivados: 0, errores: 1 }
   }
 
