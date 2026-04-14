@@ -10,9 +10,9 @@ const { query } = require('../db')
 //   vendedores.uuid  ←→  nexus.vendor.nexus_uuid
 //
 // Flujo:
-//   1. Admin crea el vendedor en Odoo → nexus_uuid se autogenera
-//   2. Este cron lo replica a PostgreSQL con ese mismo UUID
-//   3. El vendedor inicia sesión en la app con email + password temporal
+//   1. Admin crea el vendedor en Odoo → nexus_uuid y nexus_password se autogeneran
+//   2. Este cron lo replica a PostgreSQL usando la contraseña de Odoo (hasheada aquí)
+//   3. El vendedor inicia sesión en la app con email + esa contraseña
 // ─────────────────────────────────────────
 
 async function syncVendors(odooCall) {
@@ -25,7 +25,7 @@ async function syncVendors(odooCall) {
       'nexus.vendor',
       'search_read',
       [[['active', '=', true]]],
-      { fields: ['id', 'nexus_uuid', 'name', 'email', 'zone'], limit: 500 }
+      { fields: ['id', 'nexus_uuid', 'name', 'email', 'phone', 'zone', 'nexus_password', 'image_url'], limit: 500 }
     )
   } catch (err) {
     console.error('[SYNC_VENDORS] Error al leer nexus.vendor desde Odoo:', err.message)
@@ -50,9 +50,13 @@ async function syncVendors(odooCall) {
       continue
     }
 
-    // Email viene del partner asociado en Odoo (campo stored-related en nexus.vendor)
     if (!v.email) {
-      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin email en su contacto Odoo — omitido`)
+      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin email — omitido`)
+      continue
+    }
+
+    if (!v.nexus_password) {
+      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin nexus_password — omitido`)
       continue
     }
 
@@ -60,8 +64,10 @@ async function syncVendors(odooCall) {
     const zona  = v.zone || null
 
     // Buscar por uuid (vínculo principal) o por email como fallback
+    const imageUrl = v.image_url || null
+
     const existing = await query(
-      `SELECT id, nombre, email, zona, activo
+      `SELECT id, nombre, email, zona, imagen_url, activo
        FROM vendedores
        WHERE uuid = $1 OR email = $2
        LIMIT 1`,
@@ -71,9 +77,10 @@ async function syncVendors(odooCall) {
     if (existing.rows.length) {
       const row = existing.rows[0]
       const cambios = (
-        row.nombre !== v.name ||
-        row.email  !== email  ||
-        row.zona   !== zona   ||
+        row.nombre     !== v.name   ||
+        row.email      !== email    ||
+        row.zona       !== zona     ||
+        row.imagen_url !== imageUrl ||
         !row.activo
       )
 
@@ -81,27 +88,24 @@ async function syncVendors(odooCall) {
         await query(
           `UPDATE vendedores
            SET nombre = $1, email = $2, zona = $3, activo = true,
-               uuid = $4, odoo_vendor_id = $5
-           WHERE id = $6`,
-          [v.name, email, zona, v.nexus_uuid, v.id, row.id]
+               uuid = $4, odoo_vendor_id = $5, imagen_url = $6
+           WHERE id = $7`,
+          [v.name, email, zona, v.nexus_uuid, v.id, imageUrl, row.id]
         )
         console.log(`[SYNC_VENDORS] Actualizado: ${v.name} (${email})`)
         actualizados++
       }
     } else {
-      // Vendedor nuevo — crear con password temporal
-      const passwordTemporal = generarPassword()
-      const hash = await bcrypt.hash(passwordTemporal, 10)
+      // Vendedor nuevo — hashear la contraseña que viene de Odoo
+      const hash = await bcrypt.hash(v.nexus_password, 10)
 
       await query(
-        `INSERT INTO vendedores (uuid, odoo_vendor_id, nombre, email, password_hash, zona, activo)
-         VALUES ($1, $2, $3, $4, $5, $6, true)`,
-        [v.nexus_uuid, v.id, v.name, email, hash, zona]
+        `INSERT INTO vendedores (uuid, odoo_vendor_id, nombre, email, password_hash, zona, imagen_url, activo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true)`,
+        [v.nexus_uuid, v.id, v.name, email, hash, zona, imageUrl]
       )
 
-      // Password temporal — el admin la distribuye al vendedor
-      // TODO: reemplazar con envío por email/WhatsApp cuando esté disponible
-      console.log(`[SYNC_VENDORS] Creado: ${v.name} (${email}) — password temporal: ${passwordTemporal}`)
+      console.log(`[SYNC_VENDORS] Creado: ${v.name} (${email}) — contraseña generada en Odoo`)
       creados++
     }
   }
@@ -131,16 +135,6 @@ async function syncVendors(odooCall) {
 
   console.log(`[SYNC_VENDORS] Completado — creados: ${creados}, actualizados: ${actualizados}`)
   return { creados, actualizados, desactivados: 0 }
-}
-
-// Password temporal: 8 caracteres alfanuméricos sin ambiguos
-function generarPassword() {
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
-  let pass = ''
-  for (let i = 0; i < 8; i++) {
-    pass += chars[Math.floor(Math.random() * chars.length)]
-  }
-  return pass
 }
 
 module.exports = { syncVendors }

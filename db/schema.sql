@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS vendedores (
   email           TEXT UNIQUE NOT NULL,
   password_hash   TEXT NOT NULL,                        -- bcrypt
   zona            TEXT,                                 -- zona geográfica asignada
+  imagen_url      TEXT,                                 -- URL de foto del vendedor (desde Odoo /web/image)
   activo          BOOLEAN DEFAULT TRUE,
   device_id       TEXT,                                 -- binding del dispositivo
   ultimo_login    TIMESTAMPTZ,
