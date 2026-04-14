@@ -6,10 +6,7 @@ const bcrypt = require('bcrypt')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
-const { syncVendors }   = require('./crons/sync_vendors')
-const { syncClients }   = require('./crons/sync_clients')
-const { generateRoutes } = require('./crons/generate_routes')
-const cron              = require('node-cron')
+const { syncVendors } = require('./crons/sync_vendors')
 
 // ─────────────────────────────────────────
 // Odoo client
@@ -53,8 +50,7 @@ async function odooCall(model, method, args = [], kwargs = {}) {
   }
 }
 
-// Helper para endpoints custom del módulo nexus_mobile
-// Mismo patrón de re-auth que odooCall — maneja sesión expirada automáticamente
+// Helper para endpoints custom del módulo nexus_mobile (no /web/dataset/call_kw)
 async function odooPost(path, params = {}) {
   if (!odooSession) await odooAuth()
   try {
@@ -95,10 +91,6 @@ async function verifyToken(request, reply) {
 const CATALOG_TTL_SEC = 60 * 60 // 1 hora
 
 async function fetchCatalogFromOdoo() {
-  // Delega al controller del módulo nexus_mobile — encapsula la lógica
-  // de ir.attachment + product.product en un solo endpoint controlado por Odoo.
-  // Shape de respuesta idéntico al anterior: id, name, list_price,
-  // qty_available, categ_id, default_code
   const result = await odooPost('/nexus/api/v1/catalog')
   return result.products
 }
@@ -474,18 +466,12 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   setOdooCall(odooCall)
   fastify.log.info('[BullMQ] Worker iniciado — procesando cola nexus:outbox')
 
-  // ── Health check del módulo nexus_mobile ─────────────
-  // Verifica que el módulo esté instalado en Odoo antes de arrancar los crons.
-  // odooPost maneja la autenticación — no depende de odooSession directamente.
+  // Health check del módulo nexus_mobile — warning si no está instalado
   try {
     const h = await odooPost('/nexus/api/v1/health')
-    fastify.log.info(
-      `[NEXUS MODULE] ✅ ${h.module} v${h.version} — ${h.vendor_count} vendedor(es) activo(s)`
-    )
+    fastify.log.info(`[NEXUS MODULE] ✅ ${h.module} v${h.version} — ${h.vendor_count} vendedor(es) activo(s)`)
   } catch (e) {
-    fastify.log.warn(
-      `[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — instalar nexus_mobile en Odoo para activar sync`
-    )
+    fastify.log.warn(`[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — sync de vendedores pausado hasta instalación`)
   }
 
   // Warm up catalog cache en Redis
@@ -494,46 +480,19 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     else fastify.log.info(`Catalog loaded from Redis cache`)
   }).catch(e => fastify.log.warn('Catalog warm-up failed:', e.message))
 
-  // ── Helpers de crons ─────────────────────────────────
+  // ── Cron: sync vendedores desde Odoo (cada 1 hora) ──
+  const VENDOR_SYNC_INTERVAL = 60 * 60 * 1000 // 1 hora
+
   async function runVendorSync() {
     try {
-      const r = await syncVendors(odooCall)
-      fastify.log.info(`[SYNC_VENDORS] creados: ${r.creados}, actualizados: ${r.actualizados}, desactivados: ${r.desactivados}`)
+      const result = await syncVendors(odooCall)
+      fastify.log.info(`[SYNC_VENDORS] creados: ${result.creados}, actualizados: ${result.actualizados}, desactivados: ${result.desactivados}`)
     } catch (e) {
       fastify.log.error(`[SYNC_VENDORS] Error: ${e.message}`)
     }
   }
 
-  async function runClientSync() {
-    try {
-      const r = await syncClients(odooCall)
-      fastify.log.info(`[SYNC_CLIENTS] clientes: ${r.clientes}, relaciones: ${r.relaciones}`)
-    } catch (e) {
-      fastify.log.error(`[SYNC_CLIENTS] Error: ${e.message}`)
-    }
-  }
-
-  async function runGenerateRoutes() {
-    try {
-      const r = await generateRoutes()
-      fastify.log.info(`[GEN_ROUTES] generadas: ${r.generadas}, actualizadas: ${r.actualizadas}`)
-    } catch (e) {
-      fastify.log.error(`[GEN_ROUTES] Error: ${e.message}`)
-    }
-  }
-
-  // ── Cron: sync vendedores (cada 1 hora, arranca inmediato) ──
+  // Correr al arrancar y luego cada hora
   runVendorSync()
-  setInterval(runVendorSync, 60 * 60 * 1000)
-
-  // ── Cron: sync clientes — 3:50AM y 9:50AM ────────────
-  // Corre 10 min antes de generate_routes para tener datos frescos
-  cron.schedule('50 3 * * *', runClientSync, { timezone: 'America/Caracas' })
-  cron.schedule('50 9 * * *', runClientSync, { timezone: 'America/Caracas' })
-
-  // ── Cron: generación de rutas — 4:00AM y 10:00AM ─────
-  // 4AM: rutas del día nuevo (captura cambios post-6PM del día anterior)
-  // 10AM: añade paradas nuevas a rutas aún no iniciadas
-  cron.schedule('0 4 * * *',  runGenerateRoutes, { timezone: 'America/Caracas' })
-  cron.schedule('0 10 * * *', runGenerateRoutes, { timezone: 'America/Caracas' })
+  setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
 })
