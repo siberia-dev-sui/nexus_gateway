@@ -324,6 +324,19 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
          VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (client_uuid) DO NOTHING`,
         [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.monto, payload.metodo || 'efectivo', payload.referencia || null]
       )
+    } else if (tipo === 'VISIT_CHECKIN') {
+      // Usar client_uuid como uuid de la visita — el worker lo busca por este campo
+      await query(
+        `INSERT INTO visitas (uuid, vendedor_id, cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at, estado)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'abierta') ON CONFLICT (uuid) DO NOTHING`,
+        [
+          client_uuid, vendedor_id, payload.cliente_odoo_id,
+          payload.parada_id || null,
+          payload.checkin_lat || null,
+          payload.checkin_lng || null,
+          payload.checkin_at || null
+        ]
+      )
     }
 
     // Encolar en BullMQ

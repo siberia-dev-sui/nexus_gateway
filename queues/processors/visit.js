@@ -1,7 +1,7 @@
 const { query } = require('../../db')
 
 async function processVisit(job, odooCall) {
-  const { payload, clientUuid } = job.data
+  const { tipo, payload, clientUuid } = job.data
   const {
     cliente_odoo_id,
     checkin_lat,
@@ -10,6 +10,17 @@ async function processVisit(job, odooCall) {
     checkout_at,
     notas
   } = payload
+
+  // VISIT_CHECKIN: la visita ya fue insertada en sync/push con estado 'abierta'
+  // Solo marcar como DONE en outbox — Odoo se actualiza al VISIT_CLOSED
+  if (tipo === 'VISIT_CHECKIN') {
+    await query(
+      `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW() WHERE client_uuid = $1`,
+      [clientUuid]
+    )
+    console.log(`[VISIT] ✅ CHECKIN ${clientUuid} registrado localmente`)
+    return { status: 'DONE', local_only: true }
+  }
 
   // ── Resolver UUID del vendedor ────────────────────────
   // outbox.vendedor_id → vendedores.uuid (= nexus.vendor.nexus_uuid en Odoo)
@@ -49,9 +60,10 @@ async function processVisit(job, odooCall) {
   }
 
   // ── Actualizar PostgreSQL ─────────────────────────────
+  // visitas.uuid fue seteado con client_uuid en sync/push (VISIT_CHECKIN)
   await query(
-    `UPDATE visitas SET estado = 'cerrada' WHERE uuid = $1`,
-    [clientUuid]
+    `UPDATE visitas SET estado = 'cerrada', checkout_at = $1, notas = $2 WHERE uuid = $3`,
+    [checkout_at || null, notas || null, clientUuid]
   )
   await query(
     `UPDATE outbox
