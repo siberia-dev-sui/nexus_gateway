@@ -51,11 +51,27 @@ CREATE TABLE IF NOT EXISTS clientes (
   telefono        TEXT,
   direccion       TEXT,
   zona            TEXT,
+  lat             NUMERIC(10,7),                        -- partner_latitude en Odoo
+  lng             NUMERIC(10,7),                        -- partner_longitude en Odoo
   credito_limite  NUMERIC(12,2) DEFAULT 0,
   credito_usado   NUMERIC(12,2) DEFAULT 0,
   bloqueado       BOOLEAN DEFAULT FALSE,
   last_sync       TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ─────────────────────────────────────────
+-- ASIGNACIÓN VENDEDOR → CLIENTES
+-- Fuente de verdad: nexus.vendor.client_ids en Odoo
+-- Poblado por: crons/sync_clients.js
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS vendedor_cliente_rel (
+  vendedor_id     INTEGER REFERENCES vendedores(id)    ON DELETE CASCADE,
+  cliente_odoo_id INTEGER REFERENCES clientes(odoo_id) ON DELETE CASCADE,
+  PRIMARY KEY (vendedor_id, cliente_odoo_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vcrel_vendedor ON vendedor_cliente_rel(vendedor_id);
+CREATE INDEX IF NOT EXISTS idx_vcrel_cliente  ON vendedor_cliente_rel(cliente_odoo_id);
 
 -- ─────────────────────────────────────────
 -- RUTAS

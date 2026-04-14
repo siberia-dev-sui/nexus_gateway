@@ -6,7 +6,10 @@ const bcrypt = require('bcrypt')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
-const { syncVendors } = require('./crons/sync_vendors')
+const { syncVendors }   = require('./crons/sync_vendors')
+const { syncClients }   = require('./crons/sync_clients')
+const { generateRoutes } = require('./crons/generate_routes')
+const cron              = require('node-cron')
 
 // ─────────────────────────────────────────
 // Odoo client
@@ -463,19 +466,46 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     else fastify.log.info(`Catalog loaded from Redis cache`)
   }).catch(e => fastify.log.warn('Catalog warm-up failed:', e.message))
 
-  // ── Cron: sync vendedores desde Odoo (cada 1 hora) ──
-  const VENDOR_SYNC_INTERVAL = 60 * 60 * 1000 // 1 hora
-
+  // ── Helpers de crons ─────────────────────────────────
   async function runVendorSync() {
     try {
-      const result = await syncVendors(odooCall)
-      fastify.log.info(`[SYNC_VENDORS] creados: ${result.creados}, actualizados: ${result.actualizados}, desactivados: ${result.desactivados}`)
+      const r = await syncVendors(odooCall)
+      fastify.log.info(`[SYNC_VENDORS] creados: ${r.creados}, actualizados: ${r.actualizados}, desactivados: ${r.desactivados}`)
     } catch (e) {
       fastify.log.error(`[SYNC_VENDORS] Error: ${e.message}`)
     }
   }
 
-  // Correr al arrancar y luego cada hora
+  async function runClientSync() {
+    try {
+      const r = await syncClients(odooCall)
+      fastify.log.info(`[SYNC_CLIENTS] clientes: ${r.clientes}, relaciones: ${r.relaciones}`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_CLIENTS] Error: ${e.message}`)
+    }
+  }
+
+  async function runGenerateRoutes() {
+    try {
+      const r = await generateRoutes()
+      fastify.log.info(`[GEN_ROUTES] generadas: ${r.generadas}, actualizadas: ${r.actualizadas}`)
+    } catch (e) {
+      fastify.log.error(`[GEN_ROUTES] Error: ${e.message}`)
+    }
+  }
+
+  // ── Cron: sync vendedores (cada 1 hora, arranca inmediato) ──
   runVendorSync()
-  setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
+  setInterval(runVendorSync, 60 * 60 * 1000)
+
+  // ── Cron: sync clientes — 3:50AM y 9:50AM ────────────
+  // Corre 10 min antes de generate_routes para tener datos frescos
+  cron.schedule('50 3 * * *', runClientSync, { timezone: 'America/Caracas' })
+  cron.schedule('50 9 * * *', runClientSync, { timezone: 'America/Caracas' })
+
+  // ── Cron: generación de rutas — 4:00AM y 10:00AM ─────
+  // 4AM: rutas del día nuevo (captura cambios post-6PM del día anterior)
+  // 10AM: añade paradas nuevas a rutas aún no iniciadas
+  cron.schedule('0 4 * * *',  runGenerateRoutes, { timezone: 'America/Caracas' })
+  cron.schedule('0 10 * * *', runGenerateRoutes, { timezone: 'America/Caracas' })
 })
