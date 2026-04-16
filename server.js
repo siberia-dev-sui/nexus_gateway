@@ -3,6 +3,7 @@ require('dotenv').config()
 const fastify = require('fastify')({ logger: true })
 const axios = require('axios').create({ proxy: false })
 const bcrypt = require('bcrypt')
+const crypto = require('crypto')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
@@ -114,13 +115,43 @@ fastify.get('/api/v1/health', async () => {
 
 // ── AUTH ──────────────────────────────────
 
+// Helpers de refresh token
+const REFRESH_TTL_DAYS = 30
+
+function generateRefreshToken() {
+  return crypto.randomBytes(40).toString('hex') // 80 chars, URL-safe
+}
+
+function hashToken(raw) {
+  return crypto.createHash('sha256').update(raw).digest('hex')
+}
+
+async function issueTokenPair(fastify, vendedor, deviceId) {
+  const accessToken = fastify.jwt.sign(
+    { vendedor_id: vendedor.id, uuid: vendedor.uuid, email: vendedor.email, role: vendedor.rol || 'vendedor' },
+    { expiresIn: '24h' }
+  )
+
+  const rawRefresh = generateRefreshToken()
+  const refreshHash = hashToken(rawRefresh)
+  const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 86400 * 1000)
+
+  await query(
+    `INSERT INTO refresh_tokens (vendedor_id, token_hash, device_id, expires_at)
+     VALUES ($1, $2, $3, $4)`,
+    [vendedor.id, refreshHash, deviceId || 'unknown', expiresAt]
+  )
+
+  return { accessToken, refreshToken: rawRefresh }
+}
+
 // Login real — vendedores desde PostgreSQL
 fastify.post('/api/v1/auth/login', async (request, reply) => {
-  const { email, password } = request.body || {}
+  const { email, password, device_id } = request.body || {}
   if (!email || !password) return reply.code(400).send({ error: 'Email y password requeridos' })
 
   const result = await query(
-    'SELECT id, uuid, nombre, email, password_hash, zona, device_id, activo FROM vendedores WHERE email = $1',
+    'SELECT id, uuid, nombre, email, password_hash, zona, activo FROM vendedores WHERE email = $1',
     [email.toLowerCase()]
   )
 
@@ -132,19 +163,56 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
 
   await query('UPDATE vendedores SET ultimo_login = NOW() WHERE id = $1', [vendedor.id])
 
-  const token = fastify.jwt.sign(
-    { vendedor_id: vendedor.id, uuid: vendedor.uuid, email: vendedor.email, role: 'vendedor' },
-    { expiresIn: '24h' }
-  )
+  const { accessToken, refreshToken } = await issueTokenPair(fastify, vendedor, device_id)
 
   return {
-    token,
+    token: accessToken,
+    refresh_token: refreshToken,
+    expires_in: 86400,           // segundos — 24h
     vendedor: {
       uuid: vendedor.uuid,
       nombre: vendedor.nombre,
       email: vendedor.email,
       zona: vendedor.zona
     }
+  }
+})
+
+// Renovar JWT con refresh token
+fastify.post('/api/v1/auth/refresh', async (request, reply) => {
+  const { refresh_token, device_id } = request.body || {}
+  if (!refresh_token) return reply.code(400).send({ error: 'refresh_token requerido' })
+
+  const tokenHash = hashToken(refresh_token)
+
+  const tokenResult = await query(
+    `SELECT rt.id, rt.vendedor_id, rt.expires_at, rt.revocado, rt.device_id,
+            v.uuid, v.nombre, v.email, v.zona, v.activo
+     FROM refresh_tokens rt
+     JOIN vendedores v ON v.id = rt.vendedor_id
+     WHERE rt.token_hash = $1`,
+    [tokenHash]
+  )
+
+  const row = tokenResult.rows[0]
+
+  if (!row)             return reply.code(401).send({ error: 'Token inválido' })
+  if (row.revocado)     return reply.code(401).send({ error: 'Token revocado' })
+  if (!row.activo)      return reply.code(401).send({ error: 'Vendedor inactivo' })
+  if (new Date(row.expires_at) < new Date()) {
+    return reply.code(401).send({ error: 'Token expirado' })
+  }
+
+  // Revocar el token actual (rotación — cada refresh invalida el anterior)
+  await query('UPDATE refresh_tokens SET revocado = true WHERE id = $1', [row.id])
+
+  const vendedor = { id: row.vendedor_id, uuid: row.uuid, nombre: row.nombre, email: row.email, zona: row.zona }
+  const { accessToken, refreshToken } = await issueTokenPair(fastify, vendedor, device_id || row.device_id)
+
+  return {
+    token: accessToken,
+    refresh_token: refreshToken,
+    expires_in: 86400
   }
 })
 
