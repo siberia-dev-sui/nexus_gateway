@@ -290,6 +290,24 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
   return { status: 'ok', count: clientes.length, clientes }
 })
 
+// ── EMPRESAS DEL VENDEDOR ─────────────────────────────────────────────────────
+
+fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid } = request.user  // nexus_uuid del vendedor
+
+  const result = await odooPost('/nexus/api/v1/vendor_companies', { nexus_uuid: uuid })
+  if (!result) {
+    return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
+  }
+
+  return {
+    status:             'ok',
+    count:              result.count              ?? 0,
+    default_company_id: result.default_company_id ?? null,
+    companies:          result.companies          ?? []
+  }
+})
+
 // ── SYNC MANUAL DE CLIENTES (trigger desde la app) ───────────────────────────
 
 fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
@@ -624,12 +642,6 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         `INSERT INTO pedidos (client_uuid, vendedor_id, cliente_odoo_id, total, notas)
          VALUES ($1, $2, $3, $4, $5) ON CONFLICT (client_uuid) DO NOTHING`,
         [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.total || 0, payload.notas || null]
-      )
-    } else if (tipo === 'PAYMENT_RECORDED') {
-      await query(
-        `INSERT INTO pagos (client_uuid, vendedor_id, cliente_odoo_id, monto, metodo, referencia)
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (client_uuid) DO NOTHING`,
-        [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.monto, payload.metodo || 'efectivo', payload.referencia || null]
       )
     } else if (tipo === 'VISIT_CHECKIN') {
       // Usar client_uuid como uuid de la visita — el worker lo busca por este campo

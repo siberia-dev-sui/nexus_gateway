@@ -5,7 +5,7 @@ const PRICE_TOLERANCE = 0.05
 
 async function processOrder(job, odooPost) {
   const { payload, clientUuid } = job.data
-  const { vendedor_id, cliente_odoo_id, lines, visita_uuid } = payload
+  const { vendedor_id, cliente_odoo_id, lines, visita_uuid, company_id } = payload
 
   // ── Validación de precios (Redis — no toca Odoo) ──────
   const conflictos = []
@@ -57,6 +57,7 @@ async function processOrder(job, odooPost) {
     cliente_odoo_id,
     visita_uuid:       visita_uuid || null,
     vendor_nexus_uuid: vendorNexusUuid,
+    company_id:        company_id || null,
     lines: lines.map(l => ({
       product_id: l.product_id,
       qty:        l.qty,

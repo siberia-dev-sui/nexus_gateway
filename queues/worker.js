@@ -2,7 +2,6 @@ const { Worker } = require('bullmq')
 const { connection } = require('./index')
 const { query } = require('../db')
 const { processOrder } = require('./processors/order')
-const { processPayment } = require('./processors/payment')
 const { processVisit } = require('./processors/visit')
 
 // ── Circuit Breaker ───────────────────────────────────
@@ -60,9 +59,6 @@ const worker = new Worker('nexus-outbox', async (job) => {
     switch (tipo) {
       case 'ORDER_CREATED':
         result = await processOrder(job, globalOdooPost)
-        break
-      case 'PAYMENT_RECORDED':
-        result = await processPayment(job, globalOdooPost)
         break
       case 'VISIT_CHECKIN':
       case 'VISIT_CLOSED':

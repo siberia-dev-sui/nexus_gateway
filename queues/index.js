@@ -24,11 +24,10 @@ const queueEvents = new QueueEvents('nexus-outbox', { connection })
 
 // Prioridades por tipo de evento
 const PRIORITY = {
-  ORDER_CREATED:      10,  // P0 crítico
-  PAYMENT_RECORDED:   10,  // P0 crítico
-  VISIT_CHECKIN:       7,  // P1 alto
-  VISIT_CLOSED:        7,  // P1 alto
-  PHOTO_UPLOADED:      3   // P3 background
+  ORDER_CREATED:  10,  // P0 crítico
+  VISIT_CHECKIN:   7,  // P1 alto
+  VISIT_CLOSED:    7,  // P1 alto
+  PHOTO_UPLOADED:  3   // P3 background
 }
 
 async function addToQueue(tipo, payload, clientUuid) {
