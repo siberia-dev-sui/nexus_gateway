@@ -2,72 +2,59 @@ const bcrypt = require('bcrypt')
 const { query } = require('../db')
 
 // ─────────────────────────────────────────
-// Cron: sync vendedores desde Odoo → PostgreSQL
-// Frecuencia: cada 1 hora
+// Cron: sync vendedores desde módulo nexus_mobile → PostgreSQL
+// Frecuencia: al arrancar + cada 1 hora
 //
-// Odoo (nexus.vendor) es la fuente de verdad de los vendedores.
-// El link entre ambas tablas es:
-//   vendedores.uuid  ←→  nexus.vendor.nexus_uuid
+// El módulo es la fuente de verdad de los vendedores (nexus.vendor en Odoo).
+// Endpoint: POST /nexus/api/v1/get_vendors → { vendors: [...] }
+// Campos disponibles: nexus_uuid, nombre, email, telefono, activo, odoo_id
 //
-// Flujo:
-//   1. Admin crea el vendedor en Odoo → nexus_uuid y nexus_password se autogeneran
-//   2. Este cron lo replica a PostgreSQL usando la contraseña de Odoo (hasheada aquí)
-//   3. El vendedor inicia sesión en la app con email + esa contraseña
+// Nota sobre contraseñas: el módulo no expone nexus_password por seguridad.
+// - Vendedores existentes: se actualiza el perfil, la contraseña no cambia.
+// - Vendedores nuevos: se omiten (no se puede crear sin contraseña).
+//   → Lenn debe exponer un endpoint de onboarding o añadir nexus_password al módulo.
 // ─────────────────────────────────────────
 
-async function syncVendors(odooCall) {
-  console.log('[SYNC_VENDORS] Iniciando sync desde nexus.vendor en Odoo...')
+async function syncVendors(odooPost) {
+  console.log('[SYNC_VENDORS] Iniciando sync desde módulo nexus_mobile...')
 
   let vendors = []
 
   try {
-    vendors = await odooCall(
-      'nexus.vendor',
-      'search_read',
-      [[['active', '=', true]]],
-      { fields: ['id', 'nexus_uuid', 'name', 'email', 'phone', 'zone', 'nexus_password', 'image_url'], limit: 500 }
-    )
+    const data = await odooPost('/nexus/api/v1/get_vendors', {})
+    vendors = data?.vendors || []
   } catch (err) {
-    console.error('[SYNC_VENDORS] Error al leer nexus.vendor desde Odoo:', err.message)
-    console.error('[SYNC_VENDORS] ¿Está instalado el módulo nexus_mobile en Odoo y tiene el modelo nexus.vendor?')
+    console.error('[SYNC_VENDORS] Error al llamar /get_vendors:', err.message)
     return { creados: 0, actualizados: 0, desactivados: 0, errores: 1 }
   }
 
-  if (!vendors.length) {
-    console.log('[SYNC_VENDORS] No se encontraron vendedores activos en Odoo')
+  // Filtrar solo los activos para el upsert
+  const activos = vendors.filter(v => v.activo !== false)
+
+  if (!activos.length) {
+    console.log('[SYNC_VENDORS] No hay vendedores activos en Odoo')
     return { creados: 0, actualizados: 0, desactivados: 0 }
   }
 
-  console.log(`[SYNC_VENDORS] ${vendors.length} vendedor(es) encontrados en Odoo`)
+  console.log(`[SYNC_VENDORS] ${activos.length} vendedor(es) encontrados en Odoo`)
 
   let creados = 0
   let actualizados = 0
 
-  for (const v of vendors) {
-    // nexus_uuid es obligatorio — si falta, el vendedor no puede sincronizarse
+  for (const v of activos) {
     if (!v.nexus_uuid) {
-      console.warn(`[SYNC_VENDORS] Vendedor ID=${v.id} (${v.name}) sin nexus_uuid — omitido`)
+      console.warn(`[SYNC_VENDORS] Vendedor odoo_id=${v.odoo_id} (${v.nombre}) sin nexus_uuid — omitido`)
       continue
     }
-
     if (!v.email) {
-      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin email — omitido`)
-      continue
-    }
-
-    if (!v.nexus_password) {
-      console.warn(`[SYNC_VENDORS] Vendedor ${v.name} sin nexus_password — omitido`)
+      console.warn(`[SYNC_VENDORS] Vendedor ${v.nombre} sin email — omitido`)
       continue
     }
 
     const email = v.email.toLowerCase().trim()
-    const zona  = v.zone || null
-
-    // Buscar por uuid (vínculo principal) o por email como fallback
-    const imageUrl = v.image_url || null
 
     const existing = await query(
-      `SELECT id, nombre, email, zona, imagen_url, activo
+      `SELECT id, nombre, email, activo
        FROM vendedores
        WHERE uuid = $1 OR email = $2
        LIMIT 1`,
@@ -75,56 +62,39 @@ async function syncVendors(odooCall) {
     )
 
     if (existing.rows.length) {
-      const row = existing.rows[0]
-      const cambios = (
-        row.nombre     !== v.name   ||
-        row.email      !== email    ||
-        row.zona       !== zona     ||
-        row.imagen_url !== imageUrl ||
-        !row.activo
+      // Actualizar perfil — sin tocar password_hash (módulo no lo expone)
+      await query(
+        `UPDATE vendedores
+         SET nombre = $1, email = $2, activo = true,
+             uuid = $3, odoo_vendor_id = $4
+         WHERE id = $5`,
+        [v.nombre, email, v.nexus_uuid, v.odoo_id, existing.rows[0].id]
       )
 
-      // Siempre re-hashear — la contraseña puede cambiar en Odoo en cualquier momento
-      const hash = await bcrypt.hash(v.nexus_password, 10)
-
-      if (cambios) {
-        await query(
-          `UPDATE vendedores
-           SET nombre = $1, email = $2, zona = $3, activo = true,
-               uuid = $4, odoo_vendor_id = $5, imagen_url = $6,
-               password_hash = $7
-           WHERE id = $8`,
-          [v.name, email, zona, v.nexus_uuid, v.id, imageUrl, hash, row.id]
-        )
-        console.log(`[SYNC_VENDORS] Actualizado: ${v.name} (${email})`)
+      if (
+        existing.rows[0].nombre !== v.nombre ||
+        existing.rows[0].email  !== email    ||
+        !existing.rows[0].activo
+      ) {
+        console.log(`[SYNC_VENDORS] Actualizado: ${v.nombre} (${email})`)
         actualizados++
-      } else {
-        // Sin cambios de perfil — solo sincronizar contraseña por si cambió en Odoo
-        await query(
-          `UPDATE vendedores SET password_hash = $1 WHERE id = $2`,
-          [hash, row.id]
-        )
       }
     } else {
-      // Vendedor nuevo — hashear la contraseña que viene de Odoo
-      const hash = await bcrypt.hash(v.nexus_password, 10)
-
-      await query(
-        `INSERT INTO vendedores (uuid, odoo_vendor_id, nombre, email, password_hash, zona, imagen_url, activo)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, true)`,
-        [v.nexus_uuid, v.id, v.name, email, hash, zona, imageUrl]
+      // Vendedor nuevo sin contraseña — no se puede crear hasta que el módulo exponga nexus_password
+      console.warn(
+        `[SYNC_VENDORS] Vendedor nuevo detectado: ${v.nombre} (${email}) — ` +
+        'omitido: el módulo no expone nexus_password. ' +
+        'Lenn debe añadir nexus_password al endpoint /get_vendors o crear un endpoint de onboarding.'
       )
-
-      console.log(`[SYNC_VENDORS] Creado: ${v.name} (${email}) — contraseña generada en Odoo`)
-      creados++
     }
   }
 
-  // Desactivar vendedores que ya no están activos en Odoo
-  const activeUuids = vendors
+  // Desactivar en PostgreSQL los que ya no están activos en Odoo
+  const activeUuids = activos
     .filter(v => v.nexus_uuid)
     .map(v => v.nexus_uuid)
 
+  let desactivados = 0
   if (activeUuids.length) {
     const result = await query(
       `UPDATE vendedores
@@ -136,15 +106,15 @@ async function syncVendors(odooCall) {
       [activeUuids]
     )
     if (result.rows.length) {
-      result.rows.forEach(row => {
+      result.rows.forEach(row =>
         console.log(`[SYNC_VENDORS] Desactivado: ${row.nombre} (${row.email}) — ya no está en Odoo`)
-      })
-      return { creados, actualizados, desactivados: result.rows.length }
+      )
+      desactivados = result.rows.length
     }
   }
 
-  console.log(`[SYNC_VENDORS] Completado — creados: ${creados}, actualizados: ${actualizados}`)
-  return { creados, actualizados, desactivados: 0 }
+  console.log(`[SYNC_VENDORS] Completado — creados: ${creados}, actualizados: ${actualizados}, desactivados: ${desactivados}`)
+  return { creados, actualizados, desactivados }
 }
 
 module.exports = { syncVendors }

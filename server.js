@@ -909,7 +909,7 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   async function runVendorSync() {
     try {
-      const result = await syncVendors(odooCall)
+      const result = await syncVendors(odooPost)
       fastify.log.info(`[SYNC_VENDORS] creados: ${result.creados}, actualizados: ${result.actualizados}, desactivados: ${result.desactivados}`)
     } catch (e) {
       fastify.log.error(`[SYNC_VENDORS] Error: ${e.message}`)
@@ -925,7 +925,7 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   async function runPriceSync() {
     try {
-      const result = await syncPrices(odooCall)
+      const result = await syncPrices(odooPost)
       fastify.log.info(`[SYNC_PRICES] ${result.synced} precio(s) sincronizados`)
     } catch (e) {
       fastify.log.error(`[SYNC_PRICES] Error: ${e.message}`)
