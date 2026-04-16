@@ -314,6 +314,101 @@ fastify.patch('/api/v1/routes/:ruta_uuid/stops/:parada_id', { preHandler: [verif
   return { status: 'ok' }
 })
 
+// ── VISITAS ───────────────────────────────
+
+fastify.post('/api/v1/visits', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id } = request.user
+  const {
+    tipo, client_uuid, visita_uuid,
+    cliente_odoo_id, parada_id,
+    checkin_lat, checkin_lng, checkin_at,
+    checkout_at, notas
+  } = request.body || {}
+
+  if (!tipo || !client_uuid) {
+    return reply.code(400).send({ error: 'tipo y client_uuid son requeridos' })
+  }
+
+  // ── CHECKIN ───────────────────────────────────────────
+  if (tipo === 'checkin') {
+    if (!cliente_odoo_id) {
+      return reply.code(400).send({ error: 'cliente_odoo_id requerido para checkin' })
+    }
+
+    // Idempotencia — si la visita ya existe, devolver sin error
+    const existing = await query('SELECT uuid FROM visitas WHERE uuid = $1', [client_uuid])
+    if (existing.rows.length) {
+      return { status: 'ok', visita_uuid: client_uuid, skipped: true }
+    }
+
+    const ts = checkin_at || new Date().toISOString()
+
+    await query(
+      `INSERT INTO visitas (uuid, vendedor_id, cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at, estado)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'abierta')`,
+      [client_uuid, vendedor_id, cliente_odoo_id, parada_id || null,
+       checkin_lat || null, checkin_lng || null, ts]
+    )
+
+    if (parada_id) {
+      await query(`UPDATE paradas SET estado = 'on_site' WHERE id = $1`, [parada_id])
+    }
+
+    await query(
+      `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload)
+       VALUES ($1, $2, 'VISIT_CHECKIN', 'PENDING', $3)
+       ON CONFLICT (client_uuid) DO NOTHING`,
+      [client_uuid, vendedor_id, JSON.stringify({ cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at: ts })]
+    )
+    await addToQueue('VISIT_CHECKIN', { cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at: ts }, client_uuid)
+
+    console.log(`[VISITS] ✅ CHECKIN ${client_uuid} — vendedor ${vendedor_id}, cliente ${cliente_odoo_id}`)
+    return { status: 'ok', visita_uuid: client_uuid }
+  }
+
+  // ── CHECKOUT ──────────────────────────────────────────
+  if (tipo === 'checkout') {
+    if (!visita_uuid) {
+      return reply.code(400).send({ error: 'visita_uuid requerido para checkout (UUID del checkin original)' })
+    }
+
+    const visitResult = await query(
+      `SELECT id, parada_id FROM visitas WHERE uuid = $1 AND vendedor_id = $2`,
+      [visita_uuid, vendedor_id]
+    )
+    if (!visitResult.rows.length) {
+      return reply.code(404).send({ error: 'Visita no encontrada o no pertenece a este vendedor' })
+    }
+
+    const visita = visitResult.rows[0]
+    const ts = checkout_at || new Date().toISOString()
+
+    await query(
+      `UPDATE visitas SET estado = 'cerrada', checkout_at = $1, notas = $2 WHERE uuid = $3`,
+      [ts, notas || null, visita_uuid]
+    )
+
+    if (visita.parada_id) {
+      await query(`UPDATE paradas SET estado = 'completed' WHERE id = $1`, [visita.parada_id])
+    }
+
+    // client_uuid = UUID nuevo del evento checkout (idempotencia independiente del checkin)
+    // payload incluye visita_uuid para que el worker sepa qué visita cerrar en Odoo
+    await query(
+      `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload)
+       VALUES ($1, $2, 'VISIT_CLOSED', 'PENDING', $3)
+       ON CONFLICT (client_uuid) DO NOTHING`,
+      [client_uuid, vendedor_id, JSON.stringify({ visita_uuid, checkout_at: ts, notas })]
+    )
+    await addToQueue('VISIT_CLOSED', { visita_uuid, checkout_at: ts, notas }, client_uuid)
+
+    console.log(`[VISITS] ✅ CHECKOUT visita ${visita_uuid} — evento ${client_uuid}`)
+    return { status: 'ok', visita_uuid }
+  }
+
+  return reply.code(400).send({ error: "tipo debe ser 'checkin' o 'checkout'" })
+})
+
 // ── SYNC PUSH (outbox desde Flutter) ─────
 
 fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request, reply) => {

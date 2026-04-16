@@ -34,36 +34,44 @@ async function processVisit(job, odooCall) {
   const vendorUuid = vendorRow.rows[0]?.vendor_uuid || null
 
   // ── Crear visita en Odoo ──────────────────────────────
-  // field.visit acepta vendor_uuid y lo resuelve a vendor_id internamente
+  // Para VISIT_CLOSED desde /api/v1/visits: payload.visita_uuid identifica la visita
+  // Para VISIT_CLOSED desde sync/push offline: clientUuid es el UUID de la visita (fallback)
+  const targetVisitaUuid = payload.visita_uuid || clientUuid
+  const checkoutAt = payload.checkout_at || checkout_at
+
+  // Leer datos del checkin desde PostgreSQL para completar el field.visit en Odoo
+  const visitaRow = await query(
+    `SELECT cliente_odoo_id, checkin_lat, checkin_lng, checkin_at FROM visitas WHERE uuid = $1`,
+    [targetVisitaUuid]
+  )
+  const visitaData = visitaRow.rows[0] || {}
+
   let odooVisitId = null
   try {
-    const visitData = {
-      partner_id:        cliente_odoo_id,
-      checkin_lat:       checkin_lat,
-      checkin_lng:       checkin_lng,
-      checkin_datetime:  checkin_at,
-      checkout_datetime: checkout_at,
+    const visitOdoo = {
+      partner_id:        visitaData.cliente_odoo_id || cliente_odoo_id,
+      checkin_lat:       visitaData.checkin_lat     || checkin_lat,
+      checkin_lng:       visitaData.checkin_lng     || checkin_lng,
+      checkin_datetime:  visitaData.checkin_at      || checkin_at,
+      checkout_datetime: checkoutAt,
       notes:             notas || '',
-      nexus_uuid:        clientUuid
+      nexus_uuid:        targetVisitaUuid           // idempotencia en Odoo
     }
 
-    // Pasar vendor_uuid si está disponible — Odoo lo resuelve al nexus.vendor correcto
     if (vendorUuid) {
-      visitData.vendor_uuid = vendorUuid
+      visitOdoo.vendor_uuid = vendorUuid
     }
 
-    odooVisitId = await odooCall('field.visit', 'create', [visitData])
+    odooVisitId = await odooCall('field.visit', 'create', [visitOdoo])
   } catch (err) {
-    // field.visit puede no existir aún o tener un error transitorio
-    // En ese caso guardamos solo en PostgreSQL y seguimos
+    // field.visit puede no existir aún — seguimos, solo guardamos en PostgreSQL
     console.warn(`[VISIT] No se pudo crear en Odoo: ${err.message}`)
   }
 
   // ── Actualizar PostgreSQL ─────────────────────────────
-  // visitas.uuid fue seteado con client_uuid en sync/push (VISIT_CHECKIN)
   await query(
     `UPDATE visitas SET estado = 'cerrada', checkout_at = $1, notas = $2 WHERE uuid = $3`,
-    [checkout_at || null, notas || null, clientUuid]
+    [checkoutAt || null, notas || null, targetVisitaUuid]
   )
   await query(
     `UPDATE outbox
@@ -73,7 +81,7 @@ async function processVisit(job, odooCall) {
   )
 
   console.log(
-    `[VISIT] ✅ ${clientUuid} cerrada` +
+    `[VISIT] ✅ ${targetVisitaUuid} cerrada` +
     (odooVisitId ? ` → Odoo field.visit ID: ${odooVisitId}` : ' (local only)') +
     (vendorUuid  ? ` — vendedor: ${vendorUuid.slice(0, 8)}…` : '')
   )
