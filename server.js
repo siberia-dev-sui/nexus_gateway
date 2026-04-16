@@ -288,6 +288,101 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
   return { status: 'ok', count: clientes.length, clientes }
 })
 
+// ── SYNC MANUAL DE CLIENTES (trigger desde la app) ───────────────────────────
+
+fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id, uuid } = request.user
+
+  // Consultar Odoo solo para este vendedor
+  const result = await odooPost('/nexus/api/v1/vendor_clients', { nexus_uuid: uuid })
+  if (!result) {
+    return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
+  }
+
+  const partners = result.clients || []
+
+  // Upsert clientes en PostgreSQL
+  for (const p of partners) {
+    const dir = [p.direccion].filter(Boolean).join(', ') || null
+    await query(
+      `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
+                             bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+       ON CONFLICT (odoo_id) DO UPDATE SET
+         nombre              = EXCLUDED.nombre,
+         rif                 = EXCLUDED.rif,
+         telefono            = EXCLUDED.telefono,
+         direccion           = EXCLUDED.direccion,
+         lat                 = EXCLUDED.lat,
+         lng                 = EXCLUDED.lng,
+         bloqueado           = EXCLUDED.bloqueado,
+         credito_restringido = EXCLUDED.credito_restringido,
+         motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
+         canal               = EXCLUDED.canal,
+         last_sync           = NOW()`,
+      [p.odoo_id, p.nombre, p.rif || null, p.telefono || null, dir,
+       p.lat || null, p.lng || null, p.bloqueado || false,
+       p.credito_restringido || false, p.motivo_bloqueo || null, p.canal || null]
+    )
+  }
+
+  // Actualizar relaciones: insertar nuevas y eliminar las que ya no están en Odoo
+  const clientIds = partners.map(p => p.odoo_id)
+
+  for (const odooId of clientIds) {
+    await query(
+      `INSERT INTO vendedor_cliente_rel (vendedor_id, cliente_odoo_id)
+       VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [vendedor_id, odooId]
+    )
+  }
+
+  if (clientIds.length) {
+    await query(
+      `DELETE FROM vendedor_cliente_rel
+       WHERE vendedor_id = $1 AND cliente_odoo_id != ALL($2::int[])`,
+      [vendedor_id, clientIds]
+    )
+  } else {
+    await query(
+      'DELETE FROM vendedor_cliente_rel WHERE vendedor_id = $1',
+      [vendedor_id]
+    )
+  }
+
+  // Devolver la lista actualizada desde PostgreSQL
+  const updated = await query(
+    `SELECT c.odoo_id, c.nombre, c.rif, c.telefono, c.direccion,
+            c.lat, c.lng, c.bloqueado, c.credito_restringido,
+            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado
+     FROM clientes c
+     INNER JOIN vendedor_cliente_rel vcr ON vcr.cliente_odoo_id = c.odoo_id
+     WHERE vcr.vendedor_id = $1
+     ORDER BY c.nombre ASC`,
+    [vendedor_id]
+  )
+
+  const clientes = updated.rows.map(c => ({
+    odoo_id:             c.odoo_id,
+    nombre:              c.nombre,
+    rif:                 c.rif,
+    telefono:            c.telefono,
+    direccion:           c.direccion,
+    lat:                 c.lat ? parseFloat(c.lat) : null,
+    lng:                 c.lng ? parseFloat(c.lng) : null,
+    bloqueado:           c.bloqueado,
+    credito_restringido: c.credito_restringido,
+    motivo_bloqueo:      c.motivo_bloqueo,
+    canal:               c.canal,
+    credito_limite:      parseFloat(c.credito_limite  || 0),
+    credito_usado:       parseFloat(c.credito_usado   || 0),
+    credito_disponible:  parseFloat((c.credito_limite || 0) - (c.credito_usado || 0)),
+  }))
+
+  fastify.log.info(`[SYNC_CLIENTS_MANUAL] vendedor_id=${vendedor_id} clientes=${clientes.length}`)
+  return { status: 'ok', count: clientes.length, clientes }
+})
+
 // ── ROUTES / RUTAS ────────────────────────
 
 fastify.get('/api/v1/routes/today', { preHandler: [verifyToken] }, async (request, reply) => {
