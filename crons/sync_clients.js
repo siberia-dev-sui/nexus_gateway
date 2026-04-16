@@ -54,7 +54,8 @@ async function syncClients(odooCall) {
           'id', 'name', 'vat', 'phone',
           'street', 'city',
           'partner_latitude', 'partner_longitude',
-          'nexus_blocked', 'nexus_credit_restricted'
+          'nexus_blocked', 'nexus_credit_restricted',
+          'nexus_block_reason', 'nexus_channel'
         ],
         limit: 5000
       }
@@ -69,24 +70,32 @@ async function syncClients(odooCall) {
   const syncedPartnerIds = new Set()
 
   for (const p of partners) {
-    const lat      = p.partner_latitude  || null
-    const lng      = p.partner_longitude || null
-    const dir      = [p.street, p.city].filter(Boolean).join(', ') || null
-    const bloqueado = p.nexus_blocked || false
+    const lat                = p.partner_latitude        || null
+    const lng                = p.partner_longitude       || null
+    const dir                = [p.street, p.city].filter(Boolean).join(', ') || null
+    const bloqueado          = p.nexus_blocked           || false
+    const creditoRestringido = p.nexus_credit_restricted || false
+    const motivoBloqueo      = p.nexus_block_reason      || null
+    const canal              = p.nexus_channel           || null
 
     await query(
-      `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng, bloqueado, last_sync)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
+                             bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
        ON CONFLICT (odoo_id) DO UPDATE SET
-         nombre    = EXCLUDED.nombre,
-         rif       = EXCLUDED.rif,
-         telefono  = EXCLUDED.telefono,
-         direccion = EXCLUDED.direccion,
-         lat       = EXCLUDED.lat,
-         lng       = EXCLUDED.lng,
-         bloqueado = EXCLUDED.bloqueado,
-         last_sync = NOW()`,
-      [p.id, p.name, p.vat || null, p.phone || null, dir, lat, lng, bloqueado]
+         nombre              = EXCLUDED.nombre,
+         rif                 = EXCLUDED.rif,
+         telefono            = EXCLUDED.telefono,
+         direccion           = EXCLUDED.direccion,
+         lat                 = EXCLUDED.lat,
+         lng                 = EXCLUDED.lng,
+         bloqueado           = EXCLUDED.bloqueado,
+         credito_restringido = EXCLUDED.credito_restringido,
+         motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
+         canal               = EXCLUDED.canal,
+         last_sync           = NOW()`,
+      [p.id, p.name, p.vat || null, p.phone || null, dir, lat, lng,
+       bloqueado, creditoRestringido, motivoBloqueo, canal]
     )
 
     syncedPartnerIds.add(p.id)

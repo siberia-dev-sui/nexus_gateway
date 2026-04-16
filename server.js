@@ -9,6 +9,7 @@ const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncPrices } = require('./crons/sync_prices')
+const { syncClients } = require('./crons/sync_clients')
 
 // ─────────────────────────────────────────
 // Odoo client
@@ -254,29 +255,34 @@ fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async () => {
 // ── CLIENTES DEL VENDEDOR ─────────────────
 
 fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, reply) => {
-  const { uuid } = request.user  // uuid = nexus.vendor.nexus_uuid en Odoo
+  const { vendedor_id } = request.user
 
-  const result = await odooPost('/nexus/api/v1/vendor_clients', { nexus_uuid: uuid })
+  const result = await query(
+    `SELECT c.odoo_id, c.nombre, c.rif, c.telefono, c.direccion,
+            c.lat, c.lng, c.bloqueado, c.credito_restringido,
+            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado
+     FROM clientes c
+     INNER JOIN vendedor_cliente_rel vcr ON vcr.cliente_odoo_id = c.odoo_id
+     WHERE vcr.vendedor_id = $1
+     ORDER BY c.nombre ASC`,
+    [vendedor_id]
+  )
 
-  if (!result) {
-    return reply.code(502).send({ error: 'No se pudo obtener clientes desde Odoo' })
-  }
-
-  const clientes = (result.clients || []).map(c => ({
+  const clientes = result.rows.map(c => ({
     odoo_id:             c.odoo_id,
     nombre:              c.nombre,
     rif:                 c.rif,
     telefono:            c.telefono,
     direccion:           c.direccion,
-    lat:                 c.lat,
-    lng:                 c.lng,
+    lat:                 c.lat ? parseFloat(c.lat) : null,
+    lng:                 c.lng ? parseFloat(c.lng) : null,
     bloqueado:           c.bloqueado,
     credito_restringido: c.credito_restringido,
     motivo_bloqueo:      c.motivo_bloqueo,
     canal:               c.canal,
-    credito_limite:      0,
-    credito_usado:       0,
-    credito_disponible:  0,
+    credito_limite:      parseFloat(c.credito_limite  || 0),
+    credito_usado:       parseFloat(c.credito_usado   || 0),
+    credito_disponible:  parseFloat((c.credito_limite || 0) - (c.credito_usado || 0)),
   }))
 
   return { status: 'ok', count: clientes.length, clientes }
@@ -705,4 +711,20 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   runPriceSync()
   setInterval(runPriceSync, PRICE_SYNC_INTERVAL)
+
+  // ── Cron: sync clientes desde Odoo (cada 6 horas) ────
+  const CLIENT_SYNC_INTERVAL = 6 * 60 * 60 * 1000
+
+  async function runClientSync() {
+    try {
+      const result = await syncClients(odooCall)
+      fastify.log.info(`[SYNC_CLIENTS] clientes: ${result.clientes}, relaciones: ${result.relaciones}`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_CLIENTS] Error: ${e.message}`)
+    }
+  }
+
+  // Correr al arrancar y luego cada 6 horas
+  runClientSync()
+  setInterval(runClientSync, CLIENT_SYNC_INTERVAL)
 })
