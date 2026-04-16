@@ -812,7 +812,7 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   async function runClientSync() {
     try {
-      const result = await syncClients(odooCall)
+      const result = await syncClients(odooPost)
       fastify.log.info(`[SYNC_CLIENTS] clientes: ${result.clientes}, relaciones: ${result.relaciones}`)
     } catch (e) {
       fastify.log.error(`[SYNC_CLIENTS] Error: ${e.message}`)

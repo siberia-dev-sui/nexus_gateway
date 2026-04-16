@@ -1,150 +1,120 @@
 const { query } = require('../db')
 
 // ─────────────────────────────────────────
-// Cron: sync clientes desde Odoo → PostgreSQL
-// Frecuencia: 3:50AM y 9:50AM (10 min antes de generate_routes)
+// Cron: sync clientes desde módulo nexus_mobile → PostgreSQL
+// Frecuencia: al arrancar + cada 6 horas
 //
-// Requiere: módulo nexus_mobile instalado en Odoo
+// Usa el endpoint batch /nexus/api/v1/all_vendor_clients del módulo,
+// que devuelve todos los vendedores con sus clientes en una sola llamada.
+// Esto reemplaza las llamadas directas al ORM de Odoo (odooCall) que
+// acoplaban el gateway a los modelos internos de Odoo.
 //
 // Flujo:
-//   1. Lee nexus.vendor con client_ids → sabe exactamente qué partners
-//      son clientes de campo (no trae todo res.partner)
-//   2. Lee esos res.partner específicos → upsert en clientes
-//   3. Upsert vendedor_cliente_rel (la asignación)
-//   4. Elimina asignaciones que ya no existen en Odoo
+//   1. Una llamada al módulo → todos los vendedores con sus clientes
+//   2. Upsert de cada cliente en tabla clientes
+//   3. Upsert de relaciones en vendedor_cliente_rel
+//   4. Elimina relaciones que ya no existen en Odoo
 // ─────────────────────────────────────────
 
-async function syncClients(odooCall) {
-  console.log('[SYNC_CLIENTS] Iniciando sync desde nexus.vendor → res.partner...')
+async function syncClients(odooPost) {
+  console.log('[SYNC_CLIENTS] Iniciando sync desde módulo nexus_mobile...')
 
-  // ── Paso 1: Leer vendedores con su cartera ────────────
-  let vendors = []
+  // ── Una sola llamada al módulo ────────────────────────────
+  let data
   try {
-    vendors = await odooCall(
-      'nexus.vendor',
-      'search_read',
-      [[['active', '=', true]]],
-      { fields: ['id', 'nexus_uuid', 'name', 'client_ids'], limit: 500 }
-    )
+    data = await odooPost('/nexus/api/v1/all_vendor_clients', {})
   } catch (err) {
-    console.error('[SYNC_CLIENTS] Error al leer nexus.vendor desde Odoo:', err.message)
-    console.error('[SYNC_CLIENTS] ¿Está instalado el módulo nexus_mobile en Odoo?')
+    console.error('[SYNC_CLIENTS] Error al llamar /all_vendor_clients:', err.message)
     return { clientes: 0, relaciones: 0, errores: 1 }
   }
 
-  // Todos los partner IDs únicos asignados a algún vendedor
-  const allClientIds = [...new Set(vendors.flatMap(v => v.client_ids || []))]
+  const vendors = data?.vendors || []
 
-  if (!allClientIds.length) {
-    console.log('[SYNC_CLIENTS] Ningún vendedor tiene clientes asignados en Odoo')
+  if (!vendors.length) {
+    console.log('[SYNC_CLIENTS] No hay vendedores activos con clientes en Odoo')
     return { clientes: 0, relaciones: 0 }
   }
 
-  console.log(`[SYNC_CLIENTS] ${allClientIds.length} cliente(s) únicos en ${vendors.length} vendedor(es)`)
+  const totalClientes = vendors.reduce((acc, v) => acc + (v.clients?.length || 0), 0)
+  console.log(`[SYNC_CLIENTS] ${vendors.length} vendedor(es), ${totalClientes} cliente(s) únicos`)
 
-  // ── Paso 2: Leer datos de esos partners específicos ───
-  let partners = []
-  try {
-    partners = await odooCall(
-      'res.partner',
-      'search_read',
-      [[['id', 'in', allClientIds]]],
-      {
-        fields: [
-          'id', 'name', 'vat', 'phone',
-          'street', 'city',
-          'partner_latitude', 'partner_longitude',
-          'nexus_blocked', 'nexus_credit_restricted',
-          'nexus_block_reason', 'nexus_channel'
-        ],
-        limit: 5000
-      }
-    )
-  } catch (err) {
-    console.error('[SYNC_CLIENTS] Error al leer res.partner desde Odoo:', err.message)
-    return { clientes: 0, relaciones: 0, errores: 1 }
-  }
-
-  // ── Paso 3: Upsert en tabla clientes ──────────────────
+  // ── Upsert de todos los clientes únicos ───────────────────
+  // Usamos un Map para evitar upserts duplicados si un cliente
+  // está asignado a más de un vendedor.
+  const clientesSyncedIds = new Set()
   let clientesSynced = 0
-  const syncedPartnerIds = new Set()
 
-  for (const p of partners) {
-    const lat                = p.partner_latitude        || null
-    const lng                = p.partner_longitude       || null
-    const dir                = [p.street, p.city].filter(Boolean).join(', ') || null
-    const bloqueado          = p.nexus_blocked           || false
-    const creditoRestringido = p.nexus_credit_restricted || false
-    const motivoBloqueo      = p.nexus_block_reason      || null
-    const canal              = p.nexus_channel           || null
+  for (const vendor of vendors) {
+    for (const c of (vendor.clients || [])) {
+      if (clientesSyncedIds.has(c.odoo_id)) continue
 
-    await query(
-      `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
-                             bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-       ON CONFLICT (odoo_id) DO UPDATE SET
-         nombre              = EXCLUDED.nombre,
-         rif                 = EXCLUDED.rif,
-         telefono            = EXCLUDED.telefono,
-         direccion           = EXCLUDED.direccion,
-         lat                 = EXCLUDED.lat,
-         lng                 = EXCLUDED.lng,
-         bloqueado           = EXCLUDED.bloqueado,
-         credito_restringido = EXCLUDED.credito_restringido,
-         motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
-         canal               = EXCLUDED.canal,
-         last_sync           = NOW()`,
-      [p.id, p.name, p.vat || null, p.phone || null, dir, lat, lng,
-       bloqueado, creditoRestringido, motivoBloqueo, canal]
-    )
+      await query(
+        `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
+                               bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+         ON CONFLICT (odoo_id) DO UPDATE SET
+           nombre              = EXCLUDED.nombre,
+           rif                 = EXCLUDED.rif,
+           telefono            = EXCLUDED.telefono,
+           direccion           = EXCLUDED.direccion,
+           lat                 = EXCLUDED.lat,
+           lng                 = EXCLUDED.lng,
+           bloqueado           = EXCLUDED.bloqueado,
+           credito_restringido = EXCLUDED.credito_restringido,
+           motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
+           canal               = EXCLUDED.canal,
+           last_sync           = NOW()`,
+        [
+          c.odoo_id, c.nombre, c.rif || null, c.telefono || null,
+          c.direccion || null, c.lat || null, c.lng || null,
+          c.bloqueado || false, c.credito_restringido || false,
+          c.motivo_bloqueo || null, c.canal || null,
+        ]
+      )
 
-    syncedPartnerIds.add(p.id)
-    clientesSynced++
+      clientesSyncedIds.add(c.odoo_id)
+      clientesSynced++
+    }
   }
 
-  console.log(`[SYNC_CLIENTS] ${clientesSynced} cliente(s) en tabla clientes`)
+  console.log(`[SYNC_CLIENTS] ${clientesSynced} cliente(s) sincronizados en tabla clientes`)
 
-  // ── Paso 4: Upsert vendedor_cliente_rel ───────────────
+  // ── Upsert de relaciones vendedor → cliente ───────────────
   let relaciones = 0
 
   for (const vendor of vendors) {
-    if (!vendor.nexus_uuid || !vendor.client_ids?.length) continue
-
-    // Buscar vendedor en PostgreSQL por uuid (= nexus.vendor.nexus_uuid)
     const vendRow = await query(
       'SELECT id FROM vendedores WHERE uuid = $1',
       [vendor.nexus_uuid]
     )
 
     if (!vendRow.rows.length) {
-      console.warn(`[SYNC_CLIENTS] Vendedor ${vendor.name} no está en PostgreSQL — ¿corrió sync_vendors?`)
+      console.warn(`[SYNC_CLIENTS] Vendedor uuid=${vendor.nexus_uuid} no está en PostgreSQL — ¿corrió sync_vendors?`)
       continue
     }
 
-    const vendedorId = vendRow.rows[0].id
-    const clientIdsValidos = vendor.client_ids.filter(id => syncedPartnerIds.has(id))
+    const vendedorId      = vendRow.rows[0].id
+    const clientIdsOdoo   = (vendor.clients || []).map(c => c.odoo_id)
 
     // Insertar relaciones nuevas
-    for (const clientOdooId of clientIdsValidos) {
+    for (const odooId of clientIdsOdoo) {
       await query(
         `INSERT INTO vendedor_cliente_rel (vendedor_id, cliente_odoo_id)
-         VALUES ($1, $2)
-         ON CONFLICT DO NOTHING`,
-        [vendedorId, clientOdooId]
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [vendedorId, odooId]
       )
       relaciones++
     }
 
-    // Eliminar asignaciones que ya no existen en Odoo
-    if (clientIdsValidos.length) {
+    // Eliminar relaciones que ya no están en Odoo
+    if (clientIdsOdoo.length) {
       await query(
         `DELETE FROM vendedor_cliente_rel
          WHERE vendedor_id = $1
            AND cliente_odoo_id != ALL($2::int[])`,
-        [vendedorId, clientIdsValidos]
+        [vendedorId, clientIdsOdoo]
       )
     } else {
-      // El vendedor perdió todos sus clientes
       await query(
         'DELETE FROM vendedor_cliente_rel WHERE vendedor_id = $1',
         [vendedorId]
