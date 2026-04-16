@@ -8,7 +8,7 @@ const fs = require('fs')
 const path = require('path')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
-const { worker, setOdooCall } = require('./queues/worker')
+const { worker, setOdooCall, setOdooPost } = require('./queues/worker')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncPrices } = require('./crons/sync_prices')
 const { syncClients } = require('./crons/sync_clients')
@@ -829,35 +829,17 @@ fastify.post('/api/v1/photos/upload', { preHandler: [verifyToken] }, async (requ
   const sizeBytes       = assembledBuffer.length
   const base64Full      = assembledBuffer.toString('base64')
 
-  // ── Subir a Odoo como ir.attachment ──────────────────
-  // Enlazado al field.visit correspondiente (si existe).
-  // TODO: mover a endpoint del módulo nexus_mobile cuando Lenn lo exponga.
+  // ── Subir foto vía módulo nexus_mobile ───────────────
   let odooAttachmentId = null
   try {
-    const visitaRow = await query(
-      'SELECT id FROM visitas WHERE uuid = $1',
-      [visita_uuid]
-    )
-    const visitaId = visitaRow.rows[0]?.id || null
-
-    // Buscar el ID de Odoo del field.visit asociado
-    let odooVisitId = null
-    try {
-      const visitIds = await odooCall('field.visit', 'search',
-        [[['nexus_uuid', '=', visita_uuid]]])
-      odooVisitId = visitIds[0] || null
-    } catch (_) { /* field.visit puede no existir en staging */ }
-
-    const attachmentPayload = {
-      name: filename,
-      datas: base64Full,
-      res_model: odooVisitId ? 'field.visit' : 'res.partner',
-      res_id: odooVisitId || 0,
-      mimetype: filename.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' : 'image/png'
-    }
-
-    odooAttachmentId = await odooCall('ir.attachment', 'create', [attachmentPayload])
-    fastify.log.info(`[PHOTOS] ✅ ${foto_uuid} → Odoo ir.attachment ID: ${odooAttachmentId}`)
+    const result = await odooPost('/nexus/api/v1/upload_attachment', {
+      visita_uuid,
+      nombre:    filename,
+      datos_b64: base64Full,
+      mimetype:  filename.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' : 'image/png'
+    })
+    odooAttachmentId = result.attachment_id
+    fastify.log.info(`[PHOTOS] ✅ ${foto_uuid} → Odoo attachment ID: ${odooAttachmentId}`)
   } catch (err) {
     fastify.log.warn(`[PHOTOS] No se pudo subir a Odoo: ${err.message} — foto guardada localmente`)
   }
@@ -903,8 +885,9 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     fastify.log.error('DB connection failed on startup:', e.message)
   }
 
-  // Inyectar odooCall al worker de BullMQ
-  setOdooCall(odooCall)
+  // Inyectar funciones Odoo al worker de BullMQ
+  setOdooCall(odooCall)   // legacy — mantener por si acaso
+  setOdooPost(odooPost)   // módulo nexus_mobile — todos los processors lo usan
   fastify.log.info('[BullMQ] Worker iniciado — procesando cola nexus:outbox')
 
   // Health check del módulo nexus_mobile — warning si no está instalado

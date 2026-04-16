@@ -59,14 +59,14 @@ const worker = new Worker('nexus-outbox', async (job) => {
 
     switch (tipo) {
       case 'ORDER_CREATED':
-        result = await processOrder(job, globalOdooCall)
+        result = await processOrder(job, globalOdooPost)
         break
       case 'PAYMENT_RECORDED':
-        result = await processPayment(job, globalOdooCall)
+        result = await processPayment(job, globalOdooPost)
         break
       case 'VISIT_CHECKIN':
       case 'VISIT_CLOSED':
-        result = await processVisit(job, globalOdooCall)
+        result = await processVisit(job, globalOdooPost)
         break
       default:
         console.warn(`[WORKER] Tipo desconocido: ${tipo}`)
@@ -120,11 +120,11 @@ worker.on('error', (err) => {
   console.error('[WORKER] Error interno:', err.message)
 })
 
-// ── Referencia global a odooCall (se inyecta desde server.js) ──
-let globalOdooCall = null
+// ── Referencias globales inyectadas desde server.js ──────────
+let globalOdooCall = null  // ORM directo (legacy — no usar en processors nuevos)
+let globalOdooPost = null  // módulo nexus_mobile (usar siempre)
 
-function setOdooCall(fn) {
-  globalOdooCall = fn
-}
+function setOdooCall(fn) { globalOdooCall = fn }
+function setOdooPost(fn) { globalOdooPost = fn }
 
-module.exports = { worker, setOdooCall }
+module.exports = { worker, setOdooCall, setOdooPost }

@@ -3,33 +3,32 @@ const { query, redis } = require('../../db')
 // Umbral de diferencia de precio aceptable (5%)
 const PRICE_TOLERANCE = 0.05
 
-async function processOrder(job, odooCall) {
+async function processOrder(job, odooPost) {
   const { payload, clientUuid } = job.data
-  const { vendedor_id, cliente_odoo_id, lines, notas } = payload
+  const { vendedor_id, cliente_odoo_id, lines, visita_uuid } = payload
 
-  // ── Validación de precios ─────────────────────────────
+  // ── Validación de precios (Redis — no toca Odoo) ──────
   const conflictos = []
 
   for (const line of lines) {
     const cachedRaw = await redis.hget('prices', String(line.product_id))
     if (cachedRaw) {
-      const precioActual = parseFloat(cachedRaw)
-      const precioVendedor = parseFloat(line.price_unit)
-      const diferencia = Math.abs(precioActual - precioVendedor) / precioActual
+      const precioActual    = parseFloat(cachedRaw)
+      const precioVendedor  = parseFloat(line.price_unit)
+      const diferencia      = Math.abs(precioActual - precioVendedor) / precioActual
 
       if (diferencia > PRICE_TOLERANCE) {
         conflictos.push({
-          product_id: line.product_id,
+          product_id:    line.product_id,
           precio_vendedor: precioVendedor,
-          precio_actual: precioActual,
-          diferencia_pct: (diferencia * 100).toFixed(1)
+          precio_actual:   precioActual,
+          diferencia_pct:  (diferencia * 100).toFixed(1)
         })
       }
     }
   }
 
   if (conflictos.length > 0) {
-    // Marcar para revisión — NO enviar a Odoo
     await query(
       `UPDATE pedidos SET estado = 'PENDING_REVIEW', precio_conflicto = $1, updated_at = NOW()
        WHERE client_uuid = $2`,
@@ -43,59 +42,31 @@ async function processOrder(job, odooCall) {
     return { status: 'PENDING_REVIEW', conflictos }
   }
 
-  // ── Resolver nexus_vendor_id y nexus_visit_id ────────
-  // Necesarios para trazabilidad en Odoo: qué vendedor y qué visita generaron el pedido.
+  // ── Resolver vendor_nexus_uuid (PostgreSQL — no toca Odoo) ──
+  const vendorRow = await query(
+    'SELECT uuid FROM vendedores WHERE id = $1',
+    [vendedor_id]
+  )
+  const vendorNexusUuid = vendorRow.rows[0]?.uuid || null
 
-  let nexusVendorId = null
-  if (vendedor_id) {
-    const vendRow = await query(
-      'SELECT odoo_vendor_id FROM vendedores WHERE id = $1',
-      [vendedor_id]
-    )
-    nexusVendorId = vendRow.rows[0]?.odoo_vendor_id || null
-  }
-
-  let nexusVisitId = null
-  if (payload.visita_uuid) {
-    try {
-      const visitIds = await odooCall('field.visit', 'search',
-        [[['nexus_uuid', '=', payload.visita_uuid]]])
-      nexusVisitId = visitIds[0] || null
-    } catch (err) {
-      // field.visit puede no existir aún en staging — no bloqueamos el pedido
-      console.warn(`[ORDER] No se pudo resolver field.visit para ${payload.visita_uuid}: ${err.message}`)
-    }
-  }
-
-  // ── Crear pedido en Odoo ──────────────────────────────
-  const orderLines = lines.map(l => [0, 0, {
-    product_id: l.product_id,
-    product_uom_qty: l.qty,
-    price_unit: l.price_unit,
-    name: l.name || ''
-  }])
-
-  const saleOrderPayload = {
-    partner_id: cliente_odoo_id,
-    order_line: orderLines,
-    note: notas || '',
-    client_order_ref: clientUuid,
-    nexus_sync_state: 'synced'
-  }
-
-  if (nexusVendorId) saleOrderPayload.nexus_vendor_id = nexusVendorId
-  if (nexusVisitId)  saleOrderPayload.nexus_visit_id  = nexusVisitId
-
-  const orderId = await odooCall('sale.order', 'create', [saleOrderPayload])
-
-  // Confirmar el pedido
-  await odooCall('sale.order', 'action_confirm', [[orderId]])
-
-  // Obtener nombre del pedido (S00123)
-  const orderData = await odooCall('sale.order', 'read', [[orderId]], {
-    fields: ['name', 'amount_total']
+  // ── Crear pedido vía módulo nexus_mobile ──────────────
+  // El módulo confirma el pedido internamente — no llamar action_confirm.
+  // La respuesta ya trae order_id y name — no llamar odoo read.
+  const result = await odooPost('/nexus/api/v1/create_order', {
+    client_uuid:       clientUuid,
+    cliente_odoo_id,
+    visita_uuid:       visita_uuid || null,
+    vendor_nexus_uuid: vendorNexusUuid,
+    lines: lines.map(l => ({
+      product_id: l.product_id,
+      qty:        l.qty,
+      price_unit: l.price_unit,
+      name:       l.name || ''
+    }))
   })
-  const orderName = orderData[0]?.name
+
+  const orderId   = result.order_id
+  const orderName = result.name
 
   // ── Actualizar PostgreSQL ─────────────────────────────
   await query(
@@ -112,8 +83,7 @@ async function processOrder(job, odooCall) {
 
   console.log(
     `[ORDER] ✅ ${clientUuid} → Odoo ${orderName} (ID: ${orderId})` +
-    (nexusVendorId ? ` — vendor: ${nexusVendorId}` : '') +
-    (nexusVisitId  ? ` — visit: ${nexusVisitId}`  : '')
+    (vendorNexusUuid ? ` — vendor: ${vendorNexusUuid.slice(0, 8)}…` : '')
   )
   return { status: 'DONE', odoo_order_id: orderId, odoo_order_name: orderName }
 }

@@ -1,40 +1,33 @@
 const { query } = require('../../db')
 
-async function processPayment(job, odooCall) {
+async function processPayment(job, odooPost) {
   const { payload, clientUuid } = job.data
-  const { cliente_odoo_id, monto, metodo, referencia } = payload
+  const { cliente_odoo_id, monto, metodo, visita_uuid } = payload
 
-  // Método de pago → journal de Odoo
-  const JOURNAL_MAP = {
-    efectivo:      'cash',
-    transferencia: 'bank',
-    cheque:        'bank'
-  }
-  const paymentMethod = JOURNAL_MAP[metodo] || 'cash'
-
-  // Buscar journal en Odoo
-  const journals = await odooCall('account.journal', 'search_read',
-    [[['type', '=', paymentMethod]]],
-    { fields: ['id', 'name'], limit: 1 }
+  // ── Resolver vendor_nexus_uuid (PostgreSQL — no toca Odoo) ──
+  const vendorRow = await query(
+    `SELECT v.uuid AS vendor_uuid
+     FROM outbox o
+     JOIN vendedores v ON v.id = o.vendedor_id
+     WHERE o.client_uuid = $1`,
+    [clientUuid]
   )
-  if (!journals.length) throw new Error(`No journal encontrado para método: ${metodo}`)
-  const journalId = journals[0].id
+  const vendorNexusUuid = vendorRow.rows[0]?.vendor_uuid || null
 
-  // Crear pago en Odoo
-  const paymentId = await odooCall('account.payment', 'create', [{
-    partner_id: cliente_odoo_id,
-    amount: monto,
-    journal_id: journalId,
-    payment_type: 'inbound',
-    partner_type: 'customer',
-    ref: referencia || clientUuid,
-    memo: `NEXUS - ${clientUuid}`
-  }])
+  // ── Crear pago vía módulo nexus_mobile ────────────────
+  // El módulo valida el journal y llama action_post internamente.
+  const result = await odooPost('/nexus/api/v1/create_payment', {
+    client_uuid:       clientUuid,
+    cliente_odoo_id,
+    visita_uuid:       visita_uuid || null,
+    vendor_nexus_uuid: vendorNexusUuid,
+    monto,
+    metodo
+  })
 
-  // Confirmar el pago (action_post)
-  await odooCall('account.payment', 'action_post', [[paymentId]])
+  const paymentId = result.payment_id
 
-  // Actualizar PostgreSQL
+  // ── Actualizar PostgreSQL ─────────────────────────────
   await query(
     `UPDATE pagos SET odoo_payment_id = $1, updated_at = NOW() WHERE client_uuid = $2`,
     [paymentId, clientUuid]
