@@ -8,6 +8,7 @@ const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
 const { syncVendors } = require('./crons/sync_vendors')
+const { syncPrices } = require('./crons/sync_prices')
 
 // ─────────────────────────────────────────
 // Odoo client
@@ -689,4 +690,19 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   // Correr al arrancar y luego cada hora
   runVendorSync()
   setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
+
+  // ── Cron: sync precios desde Odoo (cada 30 minutos) ──
+  const PRICE_SYNC_INTERVAL = 30 * 60 * 1000
+
+  async function runPriceSync() {
+    try {
+      const result = await syncPrices(odooCall)
+      fastify.log.info(`[SYNC_PRICES] ${result.synced} precio(s) sincronizados`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_PRICES] Error: ${e.message}`)
+    }
+  }
+
+  runPriceSync()
+  setInterval(runPriceSync, PRICE_SYNC_INTERVAL)
 })
