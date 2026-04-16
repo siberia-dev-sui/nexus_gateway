@@ -4,6 +4,8 @@ const fastify = require('fastify')({ logger: true })
 const axios = require('axios').create({ proxy: false })
 const bcrypt = require('bcrypt')
 const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall } = require('./queues/worker')
@@ -737,6 +739,149 @@ fastify.get('/api/v1/supervisor/team/locations', { preHandler: [verifyToken] }, 
     con_senal,
     sin_senal: locations.length - con_senal,
     vendedores: locations
+  }
+})
+
+// ─────────────────────────────────────────
+// POST /api/v1/photos/upload — upload chunked (JSON + base64)
+// ─────────────────────────────────────────
+// Protocolo de chunks:
+//   { visita_uuid, foto_uuid, filename, chunk_index (0-based), total_chunks, data (base64) }
+//   → partial: { status: "partial", foto_uuid, chunks_recibidos }
+//   → complete: { status: "complete", foto_uuid, odoo_attachment_id }
+//
+// Cada chunk se guarda en /tmp/nexus_photos/<visita_uuid>/<foto_uuid>_<N>.chunk
+// Al recibir el último chunk se ensambla, se sube a Odoo como ir.attachment y se limpia /tmp.
+// TODO: migrar la subida a un endpoint del módulo nexus_mobile cuando Lenn lo exponga.
+// ─────────────────────────────────────────
+fastify.post('/api/v1/photos/upload', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { visita_uuid, foto_uuid, filename, chunk_index, total_chunks, data } = request.body
+  const { vendedor_id } = request.user
+
+  // ── Validación básica ──────────────────────────────────
+  if (!visita_uuid || !foto_uuid || !filename || chunk_index == null || !total_chunks || !data) {
+    return reply.code(400).send({ error: 'Faltan campos: visita_uuid, foto_uuid, filename, chunk_index, total_chunks, data' })
+  }
+  if (typeof chunk_index !== 'number' || typeof total_chunks !== 'number') {
+    return reply.code(400).send({ error: 'chunk_index y total_chunks deben ser números' })
+  }
+
+  // ── Preparar directorio temporal ──────────────────────
+  const tmpDir = path.join('/tmp/nexus_photos', visita_uuid)
+  fs.mkdirSync(tmpDir, { recursive: true })
+
+  const chunkPath = path.join(tmpDir, `${foto_uuid}_${chunk_index}.chunk`)
+
+  // Decodificar y guardar el chunk
+  const chunkBuffer = Buffer.from(data, 'base64')
+  fs.writeFileSync(chunkPath, chunkBuffer)
+
+  // ── Primer chunk: registrar en tabla fotos ─────────────
+  if (chunk_index === 0) {
+    // Buscar visita_id a partir del uuid
+    const visitaRow = await query(
+      'SELECT id FROM visitas WHERE uuid = $1',
+      [visita_uuid]
+    )
+    const visitaId = visitaRow.rows[0]?.id || null
+
+    await query(
+      `INSERT INTO fotos (uuid, visita_id, vendedor_id, filename, chunks_total, chunks_recibidos)
+       VALUES ($1, $2, $3, $4, $5, 1)
+       ON CONFLICT (uuid) DO UPDATE SET chunks_recibidos = fotos.chunks_recibidos + 1`,
+      [foto_uuid, visitaId, vendedor_id, filename, total_chunks]
+    )
+  } else {
+    await query(
+      `UPDATE fotos SET chunks_recibidos = chunks_recibidos + 1 WHERE uuid = $1`,
+      [foto_uuid]
+    )
+  }
+
+  // ── ¿Es el último chunk? → ensamblar y subir a Odoo ──
+  const esUltimo = chunk_index === total_chunks - 1
+
+  if (!esUltimo) {
+    return { status: 'partial', foto_uuid, chunks_recibidos: chunk_index + 1 }
+  }
+
+  // Verificar que todos los chunks están presentes
+  for (let i = 0; i < total_chunks; i++) {
+    if (!fs.existsSync(path.join(tmpDir, `${foto_uuid}_${i}.chunk`))) {
+      return reply.code(422).send({ error: `Falta el chunk ${i} — reiniciar la subida` })
+    }
+  }
+
+  // Ensamblar todos los chunks en orden
+  const assembledPath = path.join(tmpDir, `${foto_uuid}_assembled`)
+  const writeStream = fs.createWriteStream(assembledPath)
+  for (let i = 0; i < total_chunks; i++) {
+    const chunk = fs.readFileSync(path.join(tmpDir, `${foto_uuid}_${i}.chunk`))
+    writeStream.write(chunk)
+  }
+  writeStream.end()
+  await new Promise((resolve, reject) => {
+    writeStream.on('finish', resolve)
+    writeStream.on('error', reject)
+  })
+
+  const assembledBuffer = fs.readFileSync(assembledPath)
+  const sizeBytes       = assembledBuffer.length
+  const base64Full      = assembledBuffer.toString('base64')
+
+  // ── Subir a Odoo como ir.attachment ──────────────────
+  // Enlazado al field.visit correspondiente (si existe).
+  // TODO: mover a endpoint del módulo nexus_mobile cuando Lenn lo exponga.
+  let odooAttachmentId = null
+  try {
+    const visitaRow = await query(
+      'SELECT id FROM visitas WHERE uuid = $1',
+      [visita_uuid]
+    )
+    const visitaId = visitaRow.rows[0]?.id || null
+
+    // Buscar el ID de Odoo del field.visit asociado
+    let odooVisitId = null
+    try {
+      const visitIds = await odooCall('field.visit', 'search',
+        [[['nexus_uuid', '=', visita_uuid]]])
+      odooVisitId = visitIds[0] || null
+    } catch (_) { /* field.visit puede no existir en staging */ }
+
+    const attachmentPayload = {
+      name: filename,
+      datas: base64Full,
+      res_model: odooVisitId ? 'field.visit' : 'res.partner',
+      res_id: odooVisitId || 0,
+      mimetype: filename.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' : 'image/png'
+    }
+
+    odooAttachmentId = await odooCall('ir.attachment', 'create', [attachmentPayload])
+    fastify.log.info(`[PHOTOS] ✅ ${foto_uuid} → Odoo ir.attachment ID: ${odooAttachmentId}`)
+  } catch (err) {
+    fastify.log.warn(`[PHOTOS] No se pudo subir a Odoo: ${err.message} — foto guardada localmente`)
+  }
+
+  // ── Actualizar fotos en PostgreSQL ───────────────────
+  await query(
+    `UPDATE fotos
+     SET upload_completo = true, storage_path = $1, size_bytes = $2,
+         chunks_recibidos = $3
+     WHERE uuid = $4`,
+    [assembledPath, sizeBytes, total_chunks, foto_uuid]
+  )
+
+  // Limpiar chunks temporales (mantener el ensamblado como backup)
+  for (let i = 0; i < total_chunks; i++) {
+    try { fs.unlinkSync(path.join(tmpDir, `${foto_uuid}_${i}.chunk`)) } catch (_) {}
+  }
+
+  fastify.log.info(`[PHOTOS] ${foto_uuid} ensamblado (${(sizeBytes / 1024).toFixed(1)} KB)`)
+  return {
+    status: 'complete',
+    foto_uuid,
+    size_bytes: sizeBytes,
+    odoo_attachment_id: odooAttachmentId
   }
 })
 
