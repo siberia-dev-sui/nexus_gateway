@@ -182,6 +182,37 @@ fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async () => {
   return { status: 'ok', count: products.length, products, cached }
 })
 
+// ── CLIENTES DEL VENDEDOR ─────────────────
+
+fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid } = request.user  // uuid = nexus.vendor.nexus_uuid en Odoo
+
+  const result = await odooPost('/nexus/api/v1/vendor_clients', { nexus_uuid: uuid })
+
+  if (!result) {
+    return reply.code(502).send({ error: 'No se pudo obtener clientes desde Odoo' })
+  }
+
+  const clientes = (result.clients || []).map(c => ({
+    odoo_id:             c.odoo_id,
+    nombre:              c.nombre,
+    rif:                 c.rif,
+    telefono:            c.telefono,
+    direccion:           c.direccion,
+    lat:                 c.lat,
+    lng:                 c.lng,
+    bloqueado:           c.bloqueado,
+    credito_restringido: c.credito_restringido,
+    motivo_bloqueo:      c.motivo_bloqueo,
+    canal:               c.canal,
+    credito_limite:      0,
+    credito_usado:       0,
+    credito_disponible:  0,
+  }))
+
+  return { status: 'ok', count: clientes.length, clientes }
+})
+
 // ── ROUTES / RUTAS ────────────────────────
 
 fastify.get('/api/v1/routes/today', { preHandler: [verifyToken] }, async (request, reply) => {

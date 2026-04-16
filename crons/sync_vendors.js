@@ -84,16 +84,26 @@ async function syncVendors(odooCall) {
         !row.activo
       )
 
+      // Siempre re-hashear — la contraseña puede cambiar en Odoo en cualquier momento
+      const hash = await bcrypt.hash(v.nexus_password, 10)
+
       if (cambios) {
         await query(
           `UPDATE vendedores
            SET nombre = $1, email = $2, zona = $3, activo = true,
-               uuid = $4, odoo_vendor_id = $5, imagen_url = $6
-           WHERE id = $7`,
-          [v.name, email, zona, v.nexus_uuid, v.id, imageUrl, row.id]
+               uuid = $4, odoo_vendor_id = $5, imagen_url = $6,
+               password_hash = $7
+           WHERE id = $8`,
+          [v.name, email, zona, v.nexus_uuid, v.id, imageUrl, hash, row.id]
         )
         console.log(`[SYNC_VENDORS] Actualizado: ${v.name} (${email})`)
         actualizados++
+      } else {
+        // Sin cambios de perfil — solo sincronizar contraseña por si cambió en Odoo
+        await query(
+          `UPDATE vendedores SET password_hash = $1 WHERE id = $2`,
+          [hash, row.id]
+        )
       }
     } else {
       // Vendedor nuevo — hashear la contraseña que viene de Odoo
