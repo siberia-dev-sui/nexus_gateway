@@ -686,26 +686,75 @@ fastify.get('/api/v1/sync/status', { preHandler: [verifyToken] }, async (request
 
 // ── UBICACIONES ──────────────────────────
 
-// Teléfono reporta su ubicación al gateway
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLng = (lng2 - lng1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+async function updateRedisLocation(vendedor_id, uuid, nombre, lat, lng, estado, cliente_actual) {
+  const payload = {
+    vendedor_id, uuid, nombre,
+    lat: parseFloat(lat),
+    lng: parseFloat(lng),
+    cliente_actual: cliente_actual || null,
+    estado: estado || 'en_ruta',
+    timestamp: new Date().toISOString()
+  }
+  await redis.setex(`location:${vendedor_id}`, 60 * 60 * 2, JSON.stringify(payload))
+}
+
+// Batch de puntos GPS desde Flutter (offline-first — acumula y manda al recuperar señal)
+fastify.post('/api/v1/vendors/gps_track', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id, uuid, nombre } = request.user
+  const { points } = request.body || {}
+
+  if (!Array.isArray(points) || !points.length) {
+    return reply.code(400).send({ error: 'points[] requerido' })
+  }
+
+  const values = []
+  const placeholders = []
+  let i = 1
+  for (const p of points) {
+    if (p.lat == null || p.lng == null || !p.captured_at) continue
+    placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`)
+    values.push(vendedor_id, parseFloat(p.lat), parseFloat(p.lng),
+      parseFloat(p.accuracy || 0), p.estado || 'en_ruta', p.captured_at)
+  }
+
+  if (!placeholders.length) return reply.code(400).send({ error: 'No hay puntos válidos' })
+
+  await query(
+    `INSERT INTO gps_tracks (vendedor_id, lat, lng, accuracy, estado, captured_at)
+     VALUES ${placeholders.join(', ')}`,
+    values
+  )
+
+  // Actualizar Redis con el punto más reciente del batch
+  const last = points[points.length - 1]
+  await updateRedisLocation(vendedor_id, uuid, nombre, last.lat, last.lng, last.estado, null)
+
+  return { status: 'ok', saved: placeholders.length }
+})
+
+// Compatibilidad: PATCH /vendors/location (punto único) — persiste en gps_tracks + Redis
 fastify.patch('/api/v1/vendors/location', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id, uuid, nombre } = request.user
   const { lat, lng, cliente_actual, estado } = request.body || {}
 
   if (!lat || !lng) return reply.code(400).send({ error: 'lat y lng requeridos' })
 
-  const payload = {
-    vendedor_id,
-    uuid,
-    nombre,
-    lat: parseFloat(lat),
-    lng: parseFloat(lng),
-    cliente_actual: cliente_actual || null,
-    estado: estado || 'en_ruta',            // en_ruta | en_cliente | sin_senal
-    timestamp: new Date().toISOString()
-  }
+  await query(
+    `INSERT INTO gps_tracks (vendedor_id, lat, lng, accuracy, estado, captured_at)
+     VALUES ($1, $2, $3, 0, $4, NOW())`,
+    [vendedor_id, parseFloat(lat), parseFloat(lng), estado || 'en_ruta']
+  )
 
-  // Guardar en Redis con TTL 2h (si no reporta en 2h, se considera sin señal)
-  await redis.setex(`location:${vendedor_id}`, 60 * 60 * 2, JSON.stringify(payload))
+  await updateRedisLocation(vendedor_id, uuid, nombre, lat, lng, estado, cliente_actual)
 
   return { status: 'ok' }
 })
@@ -751,6 +800,64 @@ fastify.get('/api/v1/supervisor/team/locations', { preHandler: [verifyToken] }, 
     con_senal,
     sin_senal: locations.length - con_senal,
     vendedores: locations
+  }
+})
+
+// Supervisor — track GeoJSON de un vendedor en una fecha
+fastify.get('/api/v1/supervisor/vendor/:uuid/track', { preHandler: [verifyToken] }, async (request, reply) => {
+  if (request.user.role !== 'supervisor' && request.user.role !== 'admin') {
+    return reply.code(403).send({ error: 'Solo supervisores' })
+  }
+
+  const { uuid } = request.params
+  const fecha = request.query.fecha || new Date().toISOString().split('T')[0]
+
+  const vendedorRow = await query(
+    'SELECT id FROM vendedores WHERE uuid = $1 AND activo = true',
+    [uuid]
+  )
+  if (!vendedorRow.rows.length) return reply.code(404).send({ error: 'Vendedor no encontrado' })
+
+  const vendedor_id = vendedorRow.rows[0].id
+
+  const tracks = await query(
+    `SELECT lat, lng, estado, captured_at
+     FROM gps_tracks
+     WHERE vendedor_id = $1
+       AND captured_at::date = $2::date
+     ORDER BY captured_at ASC`,
+    [vendedor_id, fecha]
+  )
+
+  if (!tracks.rows.length) {
+    return {
+      type: 'Feature',
+      geometry: null,
+      properties: { vendedor_uuid: uuid, fecha, puntos: 0, distancia_km: 0 }
+    }
+  }
+
+  const coords = tracks.rows.map(r => [parseFloat(r.lng), parseFloat(r.lat)])
+
+  let distancia_km = 0
+  for (let i = 1; i < tracks.rows.length; i++) {
+    const prev = tracks.rows[i - 1]
+    const curr = tracks.rows[i]
+    distancia_km += haversineKm(
+      parseFloat(prev.lat), parseFloat(prev.lng),
+      parseFloat(curr.lat), parseFloat(curr.lng)
+    )
+  }
+
+  return {
+    type: 'Feature',
+    geometry: { type: 'LineString', coordinates: coords },
+    properties: {
+      vendedor_uuid: uuid,
+      fecha,
+      puntos: tracks.rows.length,
+      distancia_km: Math.round(distancia_km * 10) / 10
+    }
   }
 })
 
