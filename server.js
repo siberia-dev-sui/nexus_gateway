@@ -155,7 +155,7 @@ fastify.post('/api/v1/auth/login', async (request, reply) => {
   if (!email || !password) return reply.code(400).send({ error: 'Email y password requeridos' })
 
   const result = await query(
-    'SELECT id, uuid, nombre, email, password_hash, zona, activo FROM vendedores WHERE email = $1',
+    'SELECT id, uuid, nombre, email, password_hash, zona, activo, rol FROM vendedores WHERE email = $1',
     [email.toLowerCase()]
   )
 
@@ -191,7 +191,7 @@ fastify.post('/api/v1/auth/refresh', async (request, reply) => {
 
   const tokenResult = await query(
     `SELECT rt.id, rt.vendedor_id, rt.expires_at, rt.revocado, rt.device_id,
-            v.uuid, v.nombre, v.email, v.zona, v.activo
+            v.uuid, v.nombre, v.email, v.zona, v.activo, v.rol
      FROM refresh_tokens rt
      JOIN vendedores v ON v.id = rt.vendedor_id
      WHERE rt.token_hash = $1`,
@@ -210,7 +210,7 @@ fastify.post('/api/v1/auth/refresh', async (request, reply) => {
   // Revocar el token actual (rotación — cada refresh invalida el anterior)
   await query('UPDATE refresh_tokens SET revocado = true WHERE id = $1', [row.id])
 
-  const vendedor = { id: row.vendedor_id, uuid: row.uuid, nombre: row.nombre, email: row.email, zona: row.zona }
+  const vendedor = { id: row.vendedor_id, uuid: row.uuid, nombre: row.nombre, email: row.email, zona: row.zona, rol: row.rol }
   const { accessToken, refreshToken } = await issueTokenPair(fastify, vendedor, device_id || row.device_id)
 
   return {
