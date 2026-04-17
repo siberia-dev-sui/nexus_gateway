@@ -132,7 +132,7 @@ function hashToken(raw) {
 
 async function issueTokenPair(fastify, vendedor, deviceId) {
   const accessToken = fastify.jwt.sign(
-    { vendedor_id: vendedor.id, uuid: vendedor.uuid, email: vendedor.email, role: vendedor.rol || 'vendedor' },
+    { vendedor_id: vendedor.id, uuid: vendedor.uuid, nombre: vendedor.nombre, email: vendedor.email, role: vendedor.rol || 'vendedor' },
     { expiresIn: '24h' }
   )
 
@@ -747,12 +747,6 @@ fastify.patch('/api/v1/vendors/location', { preHandler: [verifyToken] }, async (
   const { lat, lng, cliente_actual, estado } = request.body || {}
 
   if (!lat || !lng) return reply.code(400).send({ error: 'lat y lng requeridos' })
-
-  await query(
-    `INSERT INTO gps_tracks (vendedor_id, lat, lng, accuracy, estado, captured_at)
-     VALUES ($1, $2, $3, 0, $4, NOW())`,
-    [vendedor_id, parseFloat(lat), parseFloat(lng), estado || 'en_ruta']
-  )
 
   await updateRedisLocation(vendedor_id, uuid, nombre, lat, lng, estado, cliente_actual)
 
