@@ -10,8 +10,13 @@ const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall, setOdooPost } = require('./queues/worker')
 const { syncVendors } = require('./crons/sync_vendors')
-const { syncPrices } = require('./crons/sync_prices')
-const { syncClients } = require('./crons/sync_clients')
+const { syncClients, syncVendorClients } = require('./crons/sync_clients')
+const {
+  seedPriceSyncQueueFromAssignments,
+  syncPriceEvents,
+  processPriceSyncQueue,
+  getVendorPriceBook,
+} = require('./crons/sync_price_books')
 
 // ─────────────────────────────────────────
 // Odoo client
@@ -106,6 +111,35 @@ async function getCatalog() {
   const products = await fetchCatalogFromOdoo()
   await redis.setex('catalog:products', CATALOG_TTL_SEC, JSON.stringify(products))
   return { products, cached: false }
+}
+
+let priceBookSyncPromise = null
+
+async function runPriceBookSyncCycle(options = {}) {
+  if (priceBookSyncPromise) return priceBookSyncPromise
+
+  priceBookSyncPromise = (async () => {
+    const seeded = await seedPriceSyncQueueFromAssignments()
+    const events = await syncPriceEvents(odooPost)
+    const queue = await processPriceSyncQueue(odooPost, {
+      limit: options.processAll ? 1000 : (options.limit || 25),
+    })
+    return {
+      seeded,
+      queued: events.queued || 0,
+      acknowledged: events.acknowledged || 0,
+      processed: queue.processed || 0,
+      synced: queue.synced || 0,
+      skipped: queue.skipped || 0,
+      failed: queue.failed || 0,
+    }
+  })()
+
+  try {
+    return await priceBookSyncPromise
+  } finally {
+    priceBookSyncPromise = null
+  }
 }
 
 // ─────────────────────────────────────────
@@ -290,6 +324,39 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
   return { status: 'ok', count: clientes.length, clientes }
 })
 
+// ── PRICE BOOK DEL VENDEDOR ──────────────────────────────────────────────────
+
+fastify.get('/api/v1/prices/book', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id } = request.user
+  const book = await getVendorPriceBook(vendedor_id)
+  return {
+    status: 'ok',
+    ...book,
+  }
+})
+
+fastify.post('/api/v1/prices/sync', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id, uuid } = request.user
+
+  const clientSync = await syncVendorClients(odooPost, {
+    vendedorId: vendedor_id,
+    nexusUuid: uuid,
+  })
+  if (clientSync.errores) {
+    return reply.code(502).send({ error: 'No se pudo sincronizar clientes desde Odoo' })
+  }
+
+  const cycle = await runPriceBookSyncCycle({ processAll: true })
+  const book = await getVendorPriceBook(vendedor_id)
+
+  return {
+    status: 'ok',
+    client_sync: clientSync,
+    sync_cycle: cycle,
+    ...book,
+  }
+})
+
 // ── EMPRESAS DEL VENDEDOR ─────────────────────────────────────────────────────
 
 fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (request, reply) => {
@@ -313,62 +380,15 @@ fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (re
 fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id, uuid } = request.user
 
-  // Consultar Odoo solo para este vendedor
-  const result = await odooPost('/nexus/api/v1/vendor_clients', { nexus_uuid: uuid })
-  if (!result) {
+  const syncResult = await syncVendorClients(odooPost, {
+    vendedorId: vendedor_id,
+    nexusUuid: uuid,
+  })
+  if (syncResult.errores) {
     return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
   }
 
-  const partners = result.clients || []
-
-  // Upsert clientes en PostgreSQL
-  for (const p of partners) {
-    const dir = [p.direccion].filter(Boolean).join(', ') || null
-    await query(
-      `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
-                             bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-       ON CONFLICT (odoo_id) DO UPDATE SET
-         nombre              = EXCLUDED.nombre,
-         rif                 = EXCLUDED.rif,
-         telefono            = EXCLUDED.telefono,
-         direccion           = EXCLUDED.direccion,
-         lat                 = EXCLUDED.lat,
-         lng                 = EXCLUDED.lng,
-         bloqueado           = EXCLUDED.bloqueado,
-         credito_restringido = EXCLUDED.credito_restringido,
-         motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
-         canal               = EXCLUDED.canal,
-         last_sync           = NOW()`,
-      [p.odoo_id, p.nombre, p.rif || null, p.telefono || null, dir,
-       p.lat || null, p.lng || null, p.bloqueado || false,
-       p.credito_restringido || false, p.motivo_bloqueo || null, p.canal || null]
-    )
-  }
-
-  // Actualizar relaciones: insertar nuevas y eliminar las que ya no están en Odoo
-  const clientIds = partners.map(p => p.odoo_id)
-
-  for (const odooId of clientIds) {
-    await query(
-      `INSERT INTO vendedor_cliente_rel (vendedor_id, cliente_odoo_id)
-       VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-      [vendedor_id, odooId]
-    )
-  }
-
-  if (clientIds.length) {
-    await query(
-      `DELETE FROM vendedor_cliente_rel
-       WHERE vendedor_id = $1 AND cliente_odoo_id != ALL($2::int[])`,
-      [vendedor_id, clientIds]
-    )
-  } else {
-    await query(
-      'DELETE FROM vendedor_cliente_rel WHERE vendedor_id = $1',
-      [vendedor_id]
-    )
-  }
+  await runPriceBookSyncCycle({ processAll: true })
 
   // Devolver la lista actualizada desde PostgreSQL
   const updated = await query(
@@ -400,7 +420,12 @@ fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (reque
   }))
 
   fastify.log.info(`[SYNC_CLIENTS_MANUAL] vendedor_id=${vendedor_id} clientes=${clientes.length}`)
-  return { status: 'ok', count: clientes.length, clientes }
+  return {
+    status: 'ok',
+    count: clientes.length,
+    clientes,
+    pricelist_assignments: syncResult.pricelist_assignments || 0,
+  }
 })
 
 // ── ROUTES / RUTAS ────────────────────────
@@ -1033,15 +1058,17 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   runVendorSync()
   setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
 
-  // ── Cron: sync precios desde Odoo (cada 30 minutos) ──
-  const PRICE_SYNC_INTERVAL = 30 * 60 * 1000
+  // ── Cron: sync de price books desde Odoo (cada 2 minutos) ──
+  const PRICE_SYNC_INTERVAL = 2 * 60 * 1000
 
   async function runPriceSync() {
     try {
-      const result = await syncPrices(odooPost)
-      fastify.log.info(`[SYNC_PRICES] ${result.synced} precio(s) sincronizados`)
+      const result = await runPriceBookSyncCycle({ processAll: true })
+      fastify.log.info(
+        `[SYNC_PRICEBOOKS] seeded=${result.seeded} events=${result.queued} processed=${result.processed} synced=${result.synced} skipped=${result.skipped} failed=${result.failed}`
+      )
     } catch (e) {
-      fastify.log.error(`[SYNC_PRICES] Error: ${e.message}`)
+      fastify.log.error(`[SYNC_PRICEBOOKS] Error: ${e.message}`)
     }
   }
 
