@@ -85,7 +85,7 @@ async function processOrder(job, odooPost) {
     }
   }
 
-  if (conflictos.length > 0) {
+  if (process.env.ENFORCE_PRICE_VALIDATION === 'true' && conflictos.length > 0) {
     await query(
       `UPDATE pedidos SET estado = 'PENDING_REVIEW', precio_conflicto = $1, updated_at = NOW()
        WHERE client_uuid = $2`,
@@ -97,6 +97,10 @@ async function processOrder(job, odooPost) {
     )
     console.log(`[ORDER] Conflicto de precios en ${clientUuid}:`, conflictos)
     return { status: 'PENDING_REVIEW', conflictos }
+  }
+
+  if (conflictos.length > 0) {
+    console.warn(`[ORDER] Advertencia de precios en ${clientUuid}, se enviará a Odoo:`, conflictos)
   }
 
   // ── Resolver vendor_nexus_uuid (PostgreSQL — no toca Odoo) ──

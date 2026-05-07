@@ -66,11 +66,14 @@ async function odooCall(model, method, args = [], kwargs = {}) {
 async function odooPost(path, params = {}) {
   if (!odooSession) await odooAuth()
   try {
+    const startedAt = Date.now()
+    fastify.log.info(`[ODOO_POST] ${path} iniciando`)
     const res = await axios.post(
       `${process.env.ODOO_URL}${path}`,
       { jsonrpc: '2.0', method: 'call', params },
-      { headers: { Cookie: odooSession.join('; ') } }
+      { headers: { Cookie: odooSession.join('; ') }, timeout: 30000 }
     )
+    fastify.log.info(`[ODOO_POST] ${path} OK ${Date.now() - startedAt}ms`)
     if (res.data.error) {
       odooSession = null
       await odooAuth()
@@ -82,6 +85,7 @@ async function odooPost(path, params = {}) {
     return res.data.result
   } catch (err) {
     odooSession = null
+    fastify.log.error(`[ODOO_POST] ${path} ERROR: ${err.stack || err.message}`)
     throw err
   }
 }
@@ -219,7 +223,14 @@ async function drainOutboxBacklog(limit = 20) {
          FROM outbox
         WHERE estado = 'PENDING'
            OR (estado = 'SENDING' AND updated_at < NOW() - INTERVAL '5 minutes')
-        ORDER BY created_at ASC
+        ORDER BY
+          CASE tipo
+            WHEN 'ORDER_CREATED' THEN 0
+            WHEN 'VISIT_CHECKIN' THEN 1
+            WHEN 'VISIT_CLOSED' THEN 2
+            ELSE 3
+          END,
+          created_at ASC
         LIMIT $1`,
       [limit]
     )
@@ -859,7 +870,33 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       )
     }
 
-    // Encolar en BullMQ. Si Redis falla, la fila queda PENDING para el reconciliador.
+    if (tipo === 'ORDER_CREATED') {
+      try {
+        await query(
+          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW() WHERE client_uuid = $1`,
+          [client_uuid]
+        )
+        const result = await processOrder(
+          { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+          odooPost
+        )
+        results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
+        continue
+      } catch (err) {
+        await query(
+          `UPDATE outbox
+             SET estado = 'FAILED', retry_count = retry_count + 1,
+                 error_msg = $1, updated_at = NOW()
+           WHERE client_uuid = $2`,
+          [err.message, client_uuid]
+        )
+        fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: ${err.stack || err.message}`)
+        results.push({ client_uuid, status: 'FAILED', error: err.message })
+        continue
+      }
+    }
+
+    // Visitas y otros eventos quedan en outbox para procesamiento best-effort.
     try {
       await addToQueue(tipo, { ...payload, vendedor_id }, client_uuid)
     } catch (err) {
@@ -867,7 +904,6 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         `UPDATE outbox SET error_msg = $1, updated_at = NOW() WHERE client_uuid = $2`,
         [`BullMQ enqueue failed: ${err.message}`, client_uuid]
       )
-      throw err
     }
 
     results.push({ client_uuid, status: 'QUEUED' })
