@@ -258,7 +258,13 @@ async function drainOutboxBacklog(limit = 20) {
         if (row.tipo === 'ORDER_CREATED') {
           task = processOrder(job, odooPost)
         } else if (row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
-          task = processVisit(job, odooPost)
+          await query(
+            `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW()
+              WHERE client_uuid = $1`,
+            [row.client_uuid]
+          )
+          processed++
+          continue
         } else {
           await query(
             `UPDATE outbox SET estado = 'FAILED', error_msg = $1, updated_at = NOW()
@@ -758,11 +764,10 @@ fastify.post('/api/v1/visits', { preHandler: [verifyToken] }, async (request, re
 
     await query(
       `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload)
-       VALUES ($1, $2, 'VISIT_CHECKIN', 'PENDING', $3)
+       VALUES ($1, $2, 'VISIT_CHECKIN', 'DONE', $3)
        ON CONFLICT (client_uuid) DO NOTHING`,
       [client_uuid, vendedor_id, JSON.stringify({ cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at: ts })]
     )
-    await addToQueue('VISIT_CHECKIN', { cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at: ts }, client_uuid)
 
     console.log(`[VISITS] ✅ CHECKIN ${client_uuid} — vendedor ${vendedor_id}, cliente ${cliente_odoo_id}`)
     return { status: 'ok', visita_uuid: client_uuid }
@@ -798,11 +803,10 @@ fastify.post('/api/v1/visits', { preHandler: [verifyToken] }, async (request, re
     // payload incluye visita_uuid para que el worker sepa qué visita cerrar en Odoo
     await query(
       `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload)
-       VALUES ($1, $2, 'VISIT_CLOSED', 'PENDING', $3)
+       VALUES ($1, $2, 'VISIT_CLOSED', 'DONE', $3)
        ON CONFLICT (client_uuid) DO NOTHING`,
       [client_uuid, vendedor_id, JSON.stringify({ visita_uuid, checkout_at: ts, notas })]
     )
-    await addToQueue('VISIT_CLOSED', { visita_uuid, checkout_at: ts, notas }, client_uuid)
 
     console.log(`[VISITS] ✅ CHECKOUT visita ${visita_uuid} — evento ${client_uuid}`)
     return { status: 'ok', visita_uuid }
@@ -897,6 +901,16 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
     }
 
     // Visitas y otros eventos quedan en outbox para procesamiento best-effort.
+    if (tipo === 'VISIT_CHECKIN' || tipo === 'VISIT_CLOSED') {
+      await query(
+        `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW()
+          WHERE client_uuid = $1`,
+        [client_uuid]
+      )
+      results.push({ client_uuid, status: 'DONE', odoo_ref: 'local' })
+      continue
+    }
+
     try {
       await addToQueue(tipo, { ...payload, vendedor_id }, client_uuid)
     } catch (err) {
