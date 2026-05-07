@@ -1,4 +1,4 @@
-const { Queue, QueueEvents } = require('bullmq')
+const { Queue, QueueEvents, QueueScheduler } = require('bullmq')
 
 const connection = {
   host: process.env.REDIS_HOST || 'nexus_redis',
@@ -21,6 +21,7 @@ const outboxQueue = new Queue('nexus-outbox', {
 })
 
 const queueEvents = new QueueEvents('nexus-outbox', { connection })
+const queueScheduler = new QueueScheduler('nexus-outbox', { connection })
 
 // Prioridades por tipo de evento
 const PRIORITY = {
@@ -39,4 +40,4 @@ async function addToQueue(tipo, payload, clientUuid) {
   })
 }
 
-module.exports = { outboxQueue, queueEvents, addToQueue, connection }
+module.exports = { outboxQueue, queueEvents, queueScheduler, addToQueue, connection }
