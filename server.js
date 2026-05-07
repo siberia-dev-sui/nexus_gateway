@@ -241,10 +241,13 @@ async function drainOutboxBacklog(limit = 20) {
       const job = { data: { tipo: row.tipo, payload, clientUuid: row.client_uuid, vendedor_id: row.vendedor_id } }
 
       try {
+        fastify.log.info(`[OUTBOX_DRAIN] procesando ${row.tipo} ${row.client_uuid}`)
+
+        let task
         if (row.tipo === 'ORDER_CREATED') {
-          await processOrder(job, odooPost)
+          task = processOrder(job, odooPost)
         } else if (row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
-          await processVisit(job, odooPost)
+          task = processVisit(job, odooPost)
         } else {
           await query(
             `UPDATE outbox SET estado = 'FAILED', error_msg = $1, updated_at = NOW()
@@ -253,6 +256,13 @@ async function drainOutboxBacklog(limit = 20) {
           )
           continue
         }
+
+        await Promise.race([
+          task,
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Timeout procesando evento de outbox')), 45000)
+          }),
+        ])
         processed++
       } catch (err) {
         await query(
@@ -1204,7 +1214,11 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   // Inyectar funciones Odoo al worker de BullMQ
   setOdooCall(odooCall)   // legacy — mantener por si acaso
   setOdooPost(odooPost)   // módulo nexus_mobile — todos los processors lo usan
-  fastify.log.info('[BullMQ] Worker iniciado — procesando cola nexus:outbox')
+  if (worker) {
+    fastify.log.info('[BullMQ] Worker iniciado — procesando cola nexus:outbox')
+  } else {
+    fastify.log.info('[OUTBOX_DRAIN] BullMQ worker deshabilitado — procesando desde PostgreSQL')
+  }
 
   // Health check del módulo nexus_mobile — warning si no está instalado
   try {

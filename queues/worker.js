@@ -39,7 +39,8 @@ function onOdooFail() {
 }
 
 // ── Worker principal ──────────────────────────────────
-const worker = new Worker('nexus-outbox', async (job) => {
+function createWorker() {
+  return new Worker('nexus-outbox', async (job) => {
   const { tipo, clientUuid } = job.data
 
   // Circuit breaker — si Odoo está fallando, no intentar
@@ -86,17 +87,20 @@ const worker = new Worker('nexus-outbox', async (job) => {
     throw err  // BullMQ maneja el reintento
   }
 
-}, {
-  connection,
-  concurrency: 2,          // máx 2 workers simultáneos hacia Odoo
-  limiter: {
-    max: 2,
-    duration: 1000         // máx 2 jobs por segundo
-  }
-})
+  }, {
+    connection,
+    concurrency: 2,          // máx 2 workers simultáneos hacia Odoo
+    limiter: {
+      max: 2,
+      duration: 1000         // máx 2 jobs por segundo
+    }
+  })
+}
+
+const worker = process.env.ENABLE_BULLMQ_WORKER === 'true' ? createWorker() : null
 
 // ── Dead Letter Queue ─────────────────────────────────
-worker.on('failed', async (job, err) => {
+worker?.on('failed', async (job, err) => {
   const { clientUuid, tipo } = job.data
   const attempts = job.opts?.attempts || 0
   const made = job.attemptsMade || 0
@@ -116,11 +120,11 @@ worker.on('failed', async (job, err) => {
   }
 })
 
-worker.on('completed', (job) => {
+worker?.on('completed', (job) => {
   console.log(`[WORKER] ✅ Job completado: ${job.data.tipo} ${job.data.clientUuid}`)
 })
 
-worker.on('error', (err) => {
+worker?.on('error', (err) => {
   console.error('[WORKER] Error interno:', err.stack || err.message)
 })
 
