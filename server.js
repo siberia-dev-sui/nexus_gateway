@@ -837,11 +837,55 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     // Idempotencia — si ya existe este UUID, no procesar de nuevo
     const existing = await query(
-      'SELECT estado FROM outbox WHERE client_uuid = $1',
+      'SELECT estado, tipo FROM outbox WHERE client_uuid = $1',
       [client_uuid]
     )
     if (existing.rows.length) {
-      results.push({ client_uuid, status: existing.rows[0].estado, skipped: true })
+      const existingRow = existing.rows[0]
+
+      if (tipo === 'ORDER_CREATED' && existingRow.estado !== 'DONE') {
+        try {
+          await query(
+            `UPDATE outbox
+               SET estado = 'SENDING', payload = $1, error_msg = NULL, updated_at = NOW()
+             WHERE client_uuid = $2`,
+            [JSON.stringify(payload), client_uuid]
+          )
+          await query(
+            `INSERT INTO pedidos (client_uuid, vendedor_id, cliente_odoo_id, total, notas)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (client_uuid) DO NOTHING`,
+            [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.total || 0, payload.notas || null]
+          )
+          const result = await processOrder(
+            { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+            odooPost
+          )
+          results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
+        } catch (err) {
+          await query(
+            `UPDATE outbox
+               SET estado = 'FAILED', retry_count = retry_count + 1,
+                   error_msg = $1, updated_at = NOW()
+             WHERE client_uuid = $2`,
+            [err.message, client_uuid]
+          )
+          fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: ${err.stack || err.message}`)
+          results.push({ client_uuid, status: 'FAILED', error: err.message })
+        }
+        continue
+      }
+
+      if (tipo === 'VISIT_CHECKIN' || tipo === 'VISIT_CLOSED') {
+        await query(
+          `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW()
+            WHERE client_uuid = $1`,
+          [client_uuid]
+        )
+        results.push({ client_uuid, status: 'DONE', odoo_ref: 'local', skipped: true })
+        continue
+      }
+
+      results.push({ client_uuid, status: existingRow.estado, skipped: true })
       continue
     }
 
