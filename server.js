@@ -169,6 +169,40 @@ async function runPriceBookSyncCycle(options = {}) {
   }
 }
 
+async function requeueOutboxBacklog() {
+  const result = await query(
+    `SELECT client_uuid, tipo, payload, vendedor_id, estado
+       FROM outbox
+      WHERE estado = 'PENDING'
+         OR (estado = 'SENDING' AND updated_at < NOW() - INTERVAL '5 minutes')
+      ORDER BY created_at ASC
+      LIMIT 100`
+  )
+
+  let queued = 0
+  for (const row of result.rows) {
+    try {
+      await addToQueue(
+        row.tipo,
+        { ...row.payload, vendedor_id: row.vendedor_id },
+        row.client_uuid
+      )
+      if (row.estado === 'SENDING') {
+        await query(
+          `UPDATE outbox SET estado = 'PENDING', updated_at = NOW()
+            WHERE client_uuid = $1 AND estado = 'SENDING'`,
+          [row.client_uuid]
+        )
+      }
+      queued++
+    } catch (err) {
+      fastify.log.error(`[OUTBOX_REQUEUE] ${row.tipo} ${row.client_uuid}: ${err.message}`)
+    }
+  }
+
+  return queued
+}
+
 // ─────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────
@@ -743,8 +777,16 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       )
     }
 
-    // Encolar en BullMQ
-    await addToQueue(tipo, { ...payload, vendedor_id }, client_uuid)
+    // Encolar en BullMQ. Si Redis falla, la fila queda PENDING para el reconciliador.
+    try {
+      await addToQueue(tipo, { ...payload, vendedor_id }, client_uuid)
+    } catch (err) {
+      await query(
+        `UPDATE outbox SET error_msg = $1, updated_at = NOW() WHERE client_uuid = $2`,
+        [`BullMQ enqueue failed: ${err.message}`, client_uuid]
+      )
+      throw err
+    }
 
     results.push({ client_uuid, status: 'QUEUED' })
   }
@@ -1128,6 +1170,21 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   runPriceSync()
   setInterval(runPriceSync, PRICE_SYNC_INTERVAL)
+
+  // ── Cron: reconciliar outbox PENDING / SENDING zombies (cada 1 minuto) ──
+  const OUTBOX_REQUEUE_INTERVAL = 60 * 1000
+
+  async function runOutboxRequeue() {
+    try {
+      const queued = await requeueOutboxBacklog()
+      if (queued) fastify.log.info(`[OUTBOX_REQUEUE] ${queued} evento(s) reencolado(s)`)
+    } catch (e) {
+      fastify.log.error(`[OUTBOX_REQUEUE] Error: ${e.message}`)
+    }
+  }
+
+  runOutboxRequeue()
+  setInterval(runOutboxRequeue, OUTBOX_REQUEUE_INTERVAL)
 
   // ── Cron: sync clientes desde Odoo (cada 6 horas) ────
   const CLIENT_SYNC_INTERVAL = 6 * 60 * 60 * 1000
