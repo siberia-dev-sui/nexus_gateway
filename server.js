@@ -389,6 +389,34 @@ fastify.post('/api/v1/prices/sync', { preHandler: [verifyToken] }, async (reques
   }
 })
 
+// ── PEDIDOS DEL VENDEDOR ──────────────────────────────────────────────────────
+
+fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid } = request.user
+  const limit = Math.min(Math.max(Number(request.query.limit || 30), 1), 100)
+  const offset = Math.max(Number(request.query.offset || 0), 0)
+  const state = request.query.state || null
+  const search = request.query.search || null
+
+  const result = await odooPost('/nexus/api/v1/vendor_orders', {
+    vendor_nexus_uuid: uuid,
+    limit,
+    offset,
+    state,
+    search,
+  })
+  if (!result) return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
+
+  return {
+    status: 'ok',
+    orders: result.orders || [],
+    count: result.count || 0,
+    total: result.total || 0,
+    limit: result.limit || limit,
+    offset: result.offset || offset,
+  }
+})
+
 // ── EMPRESAS DEL VENDEDOR ─────────────────────────────────────────────────────
 
 fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (request, reply) => {
