@@ -9,6 +9,8 @@ const path = require('path')
 const { query, redis, testConnections } = require('./db')
 const { addToQueue } = require('./queues/index')
 const { worker, setOdooCall, setOdooPost } = require('./queues/worker')
+const { processOrder } = require('./queues/processors/order')
+const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncClients, syncVendorClients } = require('./crons/sync_clients')
 const {
@@ -73,6 +75,9 @@ async function odooPost(path, params = {}) {
       odooSession = null
       await odooAuth()
       return odooPost(path, params)  // reintento una vez
+    }
+    if (res.data.result?.error) {
+      throw new Error(res.data.result.error)
     }
     return res.data.result
   } catch (err) {
@@ -201,6 +206,73 @@ async function requeueOutboxBacklog() {
   }
 
   return queued
+}
+
+let outboxDrainPromise = null
+
+async function drainOutboxBacklog(limit = 20) {
+  if (outboxDrainPromise) return outboxDrainPromise
+
+  outboxDrainPromise = (async () => {
+    const result = await query(
+      `SELECT client_uuid, tipo, payload, vendedor_id
+         FROM outbox
+        WHERE estado = 'PENDING'
+           OR (estado = 'SENDING' AND updated_at < NOW() - INTERVAL '5 minutes')
+        ORDER BY created_at ASC
+        LIMIT $1`,
+      [limit]
+    )
+
+    let processed = 0
+    for (const row of result.rows) {
+      const claimed = await query(
+        `UPDATE outbox
+            SET estado = 'SENDING', updated_at = NOW()
+          WHERE client_uuid = $1
+            AND (estado = 'PENDING'
+              OR (estado = 'SENDING' AND updated_at < NOW() - INTERVAL '5 minutes'))
+          RETURNING client_uuid`,
+        [row.client_uuid]
+      )
+      if (!claimed.rows.length) continue
+
+      const payload = { ...(row.payload || {}), vendedor_id: row.vendedor_id }
+      const job = { data: { tipo: row.tipo, payload, clientUuid: row.client_uuid, vendedor_id: row.vendedor_id } }
+
+      try {
+        if (row.tipo === 'ORDER_CREATED') {
+          await processOrder(job, odooPost)
+        } else if (row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
+          await processVisit(job, odooPost)
+        } else {
+          await query(
+            `UPDATE outbox SET estado = 'FAILED', error_msg = $1, updated_at = NOW()
+              WHERE client_uuid = $2`,
+            [`Tipo desconocido: ${row.tipo}`, row.client_uuid]
+          )
+          continue
+        }
+        processed++
+      } catch (err) {
+        await query(
+          `UPDATE outbox
+             SET estado = 'FAILED', retry_count = retry_count + 1,
+                 error_msg = $1, updated_at = NOW()
+           WHERE client_uuid = $2`,
+          [err.message, row.client_uuid]
+        )
+        fastify.log.error(`[OUTBOX_DRAIN] ${row.tipo} ${row.client_uuid}: ${err.stack || err.message}`)
+      }
+    }
+    return processed
+  })()
+
+  try {
+    return await outboxDrainPromise
+  } finally {
+    outboxDrainPromise = null
+  }
 }
 
 // ─────────────────────────────────────────
@@ -791,6 +863,10 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
     results.push({ client_uuid, status: 'QUEUED' })
   }
 
+  drainOutboxBacklog(20).catch(err => {
+    fastify.log.error(`[OUTBOX_DRAIN] Error: ${err.stack || err.message}`)
+  })
+
   return { status: 'ok', results }
 })
 
@@ -1178,6 +1254,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     try {
       const queued = await requeueOutboxBacklog()
       if (queued) fastify.log.info(`[OUTBOX_REQUEUE] ${queued} evento(s) reencolado(s)`)
+      const processed = await drainOutboxBacklog(20)
+      if (processed) fastify.log.info(`[OUTBOX_DRAIN] ${processed} evento(s) procesado(s)`)
     } catch (e) {
       fastify.log.error(`[OUTBOX_REQUEUE] Error: ${e.message}`)
     }
