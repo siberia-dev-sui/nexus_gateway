@@ -100,17 +100,44 @@ async function verifyToken(request, reply) {
 // ─────────────────────────────────────────
 const CATALOG_TTL_SEC = 60 * 60 // 1 hora
 
-async function fetchCatalogFromOdoo() {
-  const result = await odooPost('/nexus/api/v1/catalog')
+async function fetchCatalogFromOdoo(productIds = null) {
+  const params = productIds?.length ? { product_ids: productIds } : {}
+  const result = await odooPost('/nexus/api/v1/catalog', params)
   return result.products
 }
 
-async function getCatalog() {
-  const cached = await redis.get('catalog:products')
+function catalogCacheKey(productIds = null) {
+  if (!productIds?.length) return 'catalog:products:all'
+  const sorted = [...new Set(productIds.map(Number))].sort((a, b) => a - b)
+  const hash = crypto.createHash('sha1').update(sorted.join(',')).digest('hex')
+  return `catalog:products:${hash}`
+}
+
+async function getCatalog(productIds = null) {
+  const key = catalogCacheKey(productIds)
+  const cached = await redis.get(key)
   if (cached) return { products: JSON.parse(cached), cached: true }
-  const products = await fetchCatalogFromOdoo()
-  await redis.setex('catalog:products', CATALOG_TTL_SEC, JSON.stringify(products))
+  const products = await fetchCatalogFromOdoo(productIds)
+  await redis.setex(key, CATALOG_TTL_SEC, JSON.stringify(products))
   return { products, cached: false }
+}
+
+async function getVendorCatalogProductIds(vendedorId) {
+  const result = await query(
+    `SELECT DISTINCT pp.product_id
+       FROM pricelist_prices pp
+       INNER JOIN (
+         SELECT DISTINCT cep.company_id, cep.pricelist_id
+           FROM cliente_empresa_pricelist cep
+           INNER JOIN vendedor_cliente_rel vcr ON vcr.cliente_odoo_id = cep.cliente_odoo_id
+          WHERE vcr.vendedor_id = $1
+       ) used
+         ON used.company_id = pp.company_id
+        AND used.pricelist_id = pp.pricelist_id
+      ORDER BY pp.product_id ASC`,
+    [vendedorId]
+  )
+  return result.rows.map(row => row.product_id)
 }
 
 let priceBookSyncPromise = null
@@ -283,8 +310,13 @@ fastify.get('/api/v1/product/:id/image', async (request, reply) => {
 
 // ── SYNC ──────────────────────────────────
 
-fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async () => {
-  const { products, cached } = await getCatalog()
+fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async (request) => {
+  const { vendedor_id } = request.user
+  const productIds = await getVendorCatalogProductIds(vendedor_id)
+  if (!productIds.length) {
+    return { status: 'ok', count: 0, products: [], cached: false }
+  }
+  const { products, cached } = await getCatalog(productIds)
   return { status: 'ok', count: products.length, products, cached }
 })
 
@@ -1035,12 +1067,6 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   } catch (e) {
     fastify.log.warn(`[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — sync de vendedores pausado hasta instalación`)
   }
-
-  // Warm up catalog cache en Redis
-  getCatalog().then(({ products, cached }) => {
-    if (!cached) fastify.log.info(`Catalog cache warmed: ${products.length} products`)
-    else fastify.log.info(`Catalog loaded from Redis cache`)
-  }).catch(e => fastify.log.warn('Catalog warm-up failed:', e.message))
 
   // ── Cron: sync vendedores desde Odoo (cada 1 hora) ──
   const VENDOR_SYNC_INTERVAL = 60 * 60 * 1000 // 1 hora
