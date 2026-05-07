@@ -97,8 +97,16 @@ const worker = new Worker('nexus-outbox', async (job) => {
 
 // ── Dead Letter Queue ─────────────────────────────────
 worker.on('failed', async (job, err) => {
-  if (job.attemptsMade >= job.opts.attempts) {
-    const { clientUuid, tipo } = job.data
+  const { clientUuid, tipo } = job.data
+  const attempts = job.opts?.attempts || 0
+  const made = job.attemptsMade || 0
+
+  console.error(
+    `[WORKER] ❌ Job fallido: ${tipo} ${clientUuid} ` +
+    `(${made}/${attempts}) — ${err.stack || err.message}`
+  )
+
+  if (attempts && made >= attempts) {
     console.error(`[WORKER] 💀 Dead Letter: ${tipo} ${clientUuid} — ${err.message}`)
 
     await query(
