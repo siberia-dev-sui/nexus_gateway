@@ -113,7 +113,7 @@ worker.on('completed', (job) => {
 })
 
 worker.on('error', (err) => {
-  console.error('[WORKER] Error interno:', err.message)
+  console.error('[WORKER] Error interno:', err.stack || err.message)
 })
 
 // ── Referencias globales inyectadas desde server.js ──────────

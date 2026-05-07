@@ -1,4 +1,4 @@
-const { Queue, QueueEvents, QueueScheduler } = require('bullmq')
+const { Queue, QueueEvents } = require('bullmq')
 
 const connection = {
   host: process.env.REDIS_HOST || 'nexus_redis',
@@ -21,9 +21,7 @@ const outboxQueue = new Queue('nexus-outbox', {
 })
 
 const queueEvents = new QueueEvents('nexus-outbox', { connection })
-const queueScheduler = QueueScheduler
-  ? new QueueScheduler('nexus-outbox', { connection })
-  : null
+const queueScheduler = null
 
 // Prioridades por tipo de evento
 const PRIORITY = {
