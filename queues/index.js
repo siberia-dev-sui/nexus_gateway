@@ -21,7 +21,9 @@ const outboxQueue = new Queue('nexus-outbox', {
 })
 
 const queueEvents = new QueueEvents('nexus-outbox', { connection })
-const queueScheduler = new QueueScheduler('nexus-outbox', { connection })
+const queueScheduler = QueueScheduler
+  ? new QueueScheduler('nexus-outbox', { connection })
+  : null
 
 // Prioridades por tipo de evento
 const PRIORITY = {
