@@ -5,7 +5,8 @@ const PRICE_TOLERANCE = 0.05
 
 async function processOrder(job, odooPost) {
   const { payload, clientUuid } = job.data
-  const { vendedor_id, cliente_odoo_id, lines, visita_uuid, company_id } = payload
+  const { cliente_odoo_id, lines, visita_uuid, company_id } = payload
+  const vendedor_id = payload.vendedor_id || job.data.vendedor_id
 
   // ── Validación de precios (price book local — no toca Odoo) ──────
   const conflictos = []

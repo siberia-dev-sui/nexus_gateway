@@ -744,7 +744,7 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
     }
 
     // Encolar en BullMQ
-    await addToQueue(tipo, payload, client_uuid)
+    await addToQueue(tipo, { ...payload, vendedor_id }, client_uuid)
 
     results.push({ client_uuid, status: 'QUEUED' })
   }
