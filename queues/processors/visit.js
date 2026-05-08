@@ -49,7 +49,7 @@ async function processVisit(job, odooPost) {
       [payload.checkout_at || null, notas || null, clientUuid]
     )
     await query(
-      `UPDATE outbox SET estado = 'DONE', odoo_ref = $1, updated_at = NOW()
+      `UPDATE outbox SET tipo = 'VISIT_COMPLETED', estado = 'DONE', odoo_ref = $1, updated_at = NOW()
        WHERE client_uuid = $2`,
       [String(result.visit_id), clientUuid]
     )

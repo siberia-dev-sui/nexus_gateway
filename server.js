@@ -75,9 +75,8 @@ async function odooPost(path, params = {}) {
     )
     fastify.log.info(`[ODOO_POST] ${path} OK ${Date.now() - startedAt}ms`)
     if (res.data.error) {
-      odooSession = null
-      await odooAuth()
-      return odooPost(path, params)  // reintento una vez
+      const message = res.data.error.data?.message || res.data.error.message || 'Odoo JSON-RPC error'
+      throw new Error(message)
     }
     if (res.data.result?.error) {
       throw new Error(res.data.result.error)
@@ -826,8 +825,20 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
   }
 
   const results = []
+  const seenEvents = new Set()
 
   for (const event of events) {
+    const eventKey = `${event?.tipo || ''}:${event?.client_uuid || ''}`
+    if (seenEvents.has(eventKey)) {
+      results.push({
+        client_uuid: event?.client_uuid,
+        status: 'SKIPPED_DUPLICATE',
+        skipped: true,
+      })
+      continue
+    }
+    seenEvents.add(eventKey)
+
     const { client_uuid, tipo, payload } = event
 
     if (!client_uuid || !tipo || !payload) {
@@ -847,7 +858,7 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         try {
           await query(
             `UPDATE outbox
-               SET tipo = 'VISIT_COMPLETED', estado = 'SENDING', payload = $1,
+               SET tipo = 'ORDER_CREATED', estado = 'SENDING', payload = $1,
                    error_msg = NULL, updated_at = NOW()
              WHERE client_uuid = $2`,
             [JSON.stringify(payload), client_uuid]
@@ -876,22 +887,27 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         continue
       }
 
-      if (
-        tipo === 'VISIT_COMPLETED' &&
-        (existingRow.tipo !== 'VISIT_COMPLETED' || existingRow.estado !== 'DONE' || !existingRow.odoo_ref || existingRow.odoo_ref === 'local')
-      ) {
-        if (existingRow.estado === 'SENDING' && Date.now() - new Date(existingRow.updated_at).getTime() < 2 * 60 * 1000) {
-          results.push({ client_uuid, status: 'SENDING', skipped: true })
+      if (tipo === 'VISIT_COMPLETED') {
+        if (existingRow.tipo === 'VISIT_COMPLETED' && existingRow.estado === 'DONE' && existingRow.odoo_ref && existingRow.odoo_ref !== 'local') {
+          results.push({ client_uuid, status: 'DONE', odoo_ref: existingRow.odoo_ref, skipped: true })
           continue
         }
 
         try {
-          await query(
+          const claimed = await query(
             `UPDATE outbox
-               SET estado = 'SENDING', payload = $1, error_msg = NULL, updated_at = NOW()
-             WHERE client_uuid = $2`,
+               SET tipo = 'VISIT_COMPLETED', estado = 'SENDING', payload = $1,
+                   error_msg = NULL, updated_at = NOW()
+             WHERE client_uuid = $2
+               AND NOT (tipo = 'VISIT_COMPLETED' AND estado = 'DONE' AND odoo_ref IS NOT NULL AND odoo_ref <> 'local')
+             RETURNING client_uuid`,
             [JSON.stringify(payload), client_uuid]
           )
+          if (!claimed.rows.length) {
+            results.push({ client_uuid, status: 'DONE', skipped: true })
+            continue
+          }
+
           const result = await processVisit(
             { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
             odooPost
@@ -994,7 +1010,6 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           odooPost
         )
         results.push({ client_uuid, status: result.status || 'DONE', odoo_visit_id: result.odoo_visit_id })
-        continue
       } catch (err) {
         await query(
           `UPDATE outbox
@@ -1005,8 +1020,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         )
         fastify.log.error(`[SYNC_PUSH] VISIT_COMPLETED ${client_uuid}: ${err.stack || err.message}`)
         results.push({ client_uuid, status: 'FAILED', error: err.message })
-        continue
       }
+      continue
     }
 
     // Visitas y otros eventos quedan en outbox para procesamiento best-effort.
@@ -1031,10 +1046,6 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     results.push({ client_uuid, status: 'QUEUED' })
   }
-
-  drainOutboxBacklog(20).catch(err => {
-    fastify.log.error(`[OUTBOX_DRAIN] Error: ${err.stack || err.message}`)
-  })
 
   return { status: 'ok', results }
 })
