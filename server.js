@@ -13,6 +13,12 @@ const { processOrder } = require('./queues/processors/order')
 const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncClients, syncVendorClients } = require('./crons/sync_clients')
+const { syncStock } = require('./crons/sync_stock')
+const {
+  validateAndReserve,
+  failReservations,
+  expireOldReservations,
+} = require('./crons/stock_reservations')
 const { generateRoutes } = require('./crons/generate_routes')
 const {
   seedPriceSyncQueueFromAssignments,
@@ -95,6 +101,34 @@ async function odooPost(path, params = {}) {
 // ─────────────────────────────────────────
 fastify.register(require('@fastify/cors'), { origin: true })
 fastify.register(require('@fastify/jwt'), { secret: process.env.JWT_SECRET })
+
+/**
+ * Valida stock + crea reservas para un ORDER_CREATED. Maneja la extracción
+ * de warehouse_id del payload y el fallback de seguridad (sin warehouse_id
+ * → no se puede reservar → rechaza).
+ */
+async function _validateAndReserveOrder({ orderUuid, vendorId, payload }) {
+  const warehouseId = parseInt(payload.warehouse_id, 10)
+  const lines = Array.isArray(payload.lines) ? payload.lines : []
+
+  if (!warehouseId || Number.isNaN(warehouseId)) {
+    return {
+      ok: false,
+      items: [],
+      error: 'missing_warehouse_id',
+    }
+  }
+  if (!lines.length) {
+    return { ok: false, items: [], error: 'no_lines' }
+  }
+
+  return validateAndReserve({
+    orderUuid,
+    vendorId,
+    warehouseId,
+    lines,
+  })
+}
 
 async function verifyToken(request, reply) {
   try {
@@ -568,6 +602,67 @@ fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (re
   }
 })
 
+// ── STOCK POR ALMACÉN (consumido por la app) ────────────────────────────────
+//
+// La app llama este endpoint en tres momentos:
+//   1. Al login (sin since)             → snapshot completo del almacén
+//   2. WorkManager cada 5-6h (con since) → solo cambios desde el último sync
+//   3. Pull-to-refresh (con since)       → idem
+//
+// El stock viene del cache local del gateway (tabla stock_levels), que se
+// mantiene fresco con los crons sync_stock (delta cada 20min, full cada 6h).
+// Las reservas pending NO se descuentan aquí — la validación final ocurre
+// en POST /api/v1/orders al confirmar el pedido.
+
+fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (request, reply) => {
+  const warehouseIdRaw = request.query.warehouse_id
+  const since          = request.query.since  // ISO 8601 opcional
+
+  const warehouseId = parseInt(warehouseIdRaw, 10)
+  if (!warehouseId || Number.isNaN(warehouseId)) {
+    return reply.code(400).send({
+      error: 'warehouse_id requerido y debe ser un entero positivo'
+    })
+  }
+
+  let sql = `
+    SELECT product_id, quantity, updated_at
+    FROM stock_levels
+    WHERE warehouse_id = $1
+  `
+  const params = [warehouseId]
+
+  if (since) {
+    sql += ' AND updated_at > $2'
+    params.push(since)
+  }
+
+  sql += ' ORDER BY product_id'
+
+  let rows
+  try {
+    const result = await query(sql, params)
+    rows = result.rows
+  } catch (err) {
+    fastify.log.error(`[GET /vendor/stock] Error: ${err.message}`)
+    return reply.code(500).send({ error: 'Error al consultar stock' })
+  }
+
+  const items = rows.map((r) => ({
+    product_id: r.product_id,
+    quantity:   parseFloat(r.quantity),
+    updated_at: r.updated_at,
+  }))
+
+  return {
+    status:       'ok',
+    warehouse_id: warehouseId,
+    count:        items.length,
+    synced_at:    new Date().toISOString(),
+    items,
+  }
+})
+
 // ── SYNC MANUAL DE CLIENTES (trigger desde la app) ───────────────────────────
 
 fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
@@ -887,6 +982,28 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       const existingRow = existing.rows[0]
 
       if (tipo === 'ORDER_CREATED' && existingRow.estado !== 'DONE') {
+        // Validar stock y reservar antes de tocar el pedido — anti-overselling
+        const reservation = await _validateAndReserveOrder({
+          orderUuid: client_uuid,
+          vendorId: vendedor_id,
+          payload,
+        })
+        if (!reservation.ok) {
+          await query(
+            `UPDATE outbox
+               SET estado = 'STOCK_INSUFFICIENT', error_msg = $1, updated_at = NOW()
+             WHERE client_uuid = $2`,
+            [JSON.stringify({ items: reservation.items }), client_uuid]
+          )
+          fastify.log.warn(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: stock insuficiente`)
+          results.push({
+            client_uuid,
+            status: 'STOCK_INSUFFICIENT',
+            items: reservation.items,
+          })
+          continue
+        }
+
         try {
           await query(
             `UPDATE outbox
@@ -906,6 +1023,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           )
           results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
         } catch (err) {
+          // Liberar reserva — Odoo rechazó o algo falló
+          await failReservations(client_uuid, err.message)
           await query(
             `UPDATE outbox
                SET estado = 'FAILED', retry_count = retry_count + 1,
@@ -973,6 +1092,26 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       continue
     }
 
+    // Para ORDER_CREATED: validar stock y reservar ANTES de meterlo a la outbox.
+    // Si el stock no alcanza, el pedido nunca se persiste — el vendedor recibe
+    // STOCK_INSUFFICIENT con los disponibles reales y ajusta su pedido.
+    if (tipo === 'ORDER_CREATED') {
+      const reservation = await _validateAndReserveOrder({
+        orderUuid: client_uuid,
+        vendorId: vendedor_id,
+        payload,
+      })
+      if (!reservation.ok) {
+        fastify.log.warn(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: stock insuficiente`)
+        results.push({
+          client_uuid,
+          status: 'STOCK_INSUFFICIENT',
+          items: reservation.items,
+        })
+        continue
+      }
+    }
+
     // Insertar en outbox
     await query(
       `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload, device_id)
@@ -1018,6 +1157,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
         continue
       } catch (err) {
+        // Liberar reserva — Odoo rechazó o algo falló al procesar
+        await failReservations(client_uuid, err.message)
         await query(
           `UPDATE outbox
              SET estado = 'FAILED', retry_count = retry_count + 1,
@@ -1495,4 +1636,54 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   // Correr al arrancar y luego cada 6 horas
   runClientSync()
   setInterval(runClientSync, CLIENT_SYNC_INTERVAL)
+
+  // ── Cron: sync stock desde Odoo ────────────────────────────
+  // Dos cadencias:
+  //   - Delta cada 20 min: solo cambios desde el último sync
+  //   - Full cada 6 h:    snapshot completo (reconciliación)
+  const STOCK_DELTA_INTERVAL = 20 * 60 * 1000        // 20 minutos
+  const STOCK_FULL_INTERVAL  = 6 * 60 * 60 * 1000    // 6 horas
+
+  async function runStockDelta() {
+    try {
+      const result = await syncStock(odooPost, { mode: 'delta' })
+      if (result.synced > 0 || result.errores) {
+        fastify.log.info(`[SYNC_STOCK:delta] synced=${result.synced || 0} errores=${result.errores || 0}`)
+      }
+    } catch (e) {
+      fastify.log.error(`[SYNC_STOCK:delta] Error: ${e.message}`)
+    }
+  }
+
+  async function runStockFull() {
+    try {
+      const result = await syncStock(odooPost, { mode: 'full' })
+      fastify.log.info(`[SYNC_STOCK:full] synced=${result.synced || 0} errores=${result.errores || 0}`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_STOCK:full] Error: ${e.message}`)
+    }
+  }
+
+  // Al arrancar: full sync (cubre cualquier gap durante el downtime).
+  // Después: delta cada 20min y full cada 6h independientes.
+  runStockFull()
+  setInterval(runStockDelta, STOCK_DELTA_INTERVAL)
+  setInterval(runStockFull, STOCK_FULL_INTERVAL)
+
+  // ── Cron: expirar reservas pending viejas ─────────────────────
+  // Si el worker crashea entre crear la reserva y procesarla en Odoo, la
+  // reserva quedaría 'pending' bloqueando stock indefinidamente. Este cron
+  // las marca 'expired' después de 30 min — el stock vuelve a estar
+  // disponible para otros vendedores.
+  const RESERVATION_EXPIRE_INTERVAL = 60 * 1000  // 1 minuto
+
+  async function runReservationExpiration() {
+    try {
+      await expireOldReservations()
+    } catch (e) {
+      fastify.log.error(`[RESERVATIONS] Error al expirar: ${e.message}`)
+    }
+  }
+
+  setInterval(runReservationExpiration, RESERVATION_EXPIRE_INTERVAL)
 })

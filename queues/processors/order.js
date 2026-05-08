@@ -1,4 +1,5 @@
 const { query } = require('../../db')
+const { confirmReservations } = require('../../crons/stock_reservations')
 
 // Umbral de diferencia de precio aceptable (5%)
 const PRICE_TOLERANCE = 0.05
@@ -142,6 +143,10 @@ async function processOrder(job, odooPost) {
      WHERE client_uuid = $2`,
     [String(orderId), clientUuid]
   )
+
+  // Odoo aceptó el pedido: las reservas pending pasan a confirmed.
+  // El stock comprometido en gateway queda permanentemente descontado.
+  await confirmReservations(clientUuid)
 
   console.log(
     `[ORDER] ✅ ${clientUuid} → Odoo ${orderName} (ID: ${orderId})` +
