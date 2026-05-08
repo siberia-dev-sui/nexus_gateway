@@ -13,6 +13,7 @@ const { processOrder } = require('./queues/processors/order')
 const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncClients, syncVendorClients } = require('./crons/sync_clients')
+const { generateRoutes } = require('./crons/generate_routes')
 const {
   seedPriceSyncQueueFromAssignments,
   syncPriceEvents,
@@ -636,7 +637,8 @@ fastify.get('/api/v1/routes/:fecha', { preHandler: [verifyToken] }, async (reque
 
 async function getRuta(vendedor_id, fecha, reply) {
   const rutaResult = await query(
-    `SELECT r.id, r.uuid, r.fecha, r.estado
+    `SELECT r.id, r.uuid, r.fecha, r.estado,
+            r.algoritmo, r.distancia_estimada_km, r.origen_lat, r.origen_lng
      FROM rutas r
      WHERE r.vendedor_id = $1 AND r.fecha = $2`,
     [vendedor_id, fecha]
@@ -689,8 +691,38 @@ async function getRuta(vendedor_id, fecha, reply) {
     saltadas: paradas.filter(p => p.estado === 'skipped').length
   }
 
-  return { status: 'ok', ruta: { uuid: ruta.uuid, fecha: ruta.fecha, estado: ruta.estado, paradas, kpis } }
+  return {
+    status: 'ok',
+    ruta: {
+      uuid:                  ruta.uuid,
+      fecha:                 ruta.fecha,
+      estado:                ruta.estado,
+      algoritmo:             ruta.algoritmo ?? 'nombre',
+      distancia_estimada_km: ruta.distancia_estimada_km ? parseFloat(ruta.distancia_estimada_km) : null,
+      origen_lat:            ruta.origen_lat ? parseFloat(ruta.origen_lat) : null,
+      origen_lng:            ruta.origen_lng ? parseFloat(ruta.origen_lng) : null,
+      paradas,
+      kpis,
+    },
+  }
 }
+
+// ── ADMIN: triggerear generación de rutas manualmente ─────────────────────────
+// Útil para pruebas, re-generar rutas tras sync de clientes, o forzar optimización OSRM.
+// Solo supervisores y admins.
+
+fastify.post('/api/v1/admin/routes/generate', { preHandler: [verifyToken] }, async (request, reply) => {
+  if (request.user.role !== 'supervisor' && request.user.role !== 'admin') {
+    return reply.code(403).send({ error: 'Solo supervisores pueden triggerear la generación de rutas' })
+  }
+  try {
+    const result = await generateRoutes()
+    return { status: 'ok', ...result }
+  } catch (err) {
+    fastify.log.error(`[ADMIN_ROUTES] Error generando rutas: ${err.stack || err.message}`)
+    return reply.code(500).send({ error: err.message })
+  }
+})
 
 // PATCH parada — cambiar estado o reordenar
 fastify.patch('/api/v1/routes/:ruta_uuid/stops/:parada_id', { preHandler: [verifyToken] }, async (request, reply) => {
