@@ -226,7 +226,6 @@ async function drainOutboxBacklog(limit = 20) {
         ORDER BY
           CASE tipo
             WHEN 'ORDER_CREATED' THEN 0
-            WHEN 'VISIT_COMPLETED' THEN 1
             WHEN 'VISIT_CHECKIN' THEN 2
             WHEN 'VISIT_CLOSED' THEN 3
             ELSE 3
@@ -258,9 +257,7 @@ async function drainOutboxBacklog(limit = 20) {
         let task
         if (row.tipo === 'ORDER_CREATED') {
           task = processOrder(job, odooPost)
-        } else if (row.tipo === 'VISIT_COMPLETED') {
-          task = processVisit(job, odooPost)
-        } else if (row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
+        } else if (row.tipo === 'VISIT_COMPLETED' || row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
           await query(
             `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW()
               WHERE client_uuid = $1`,
@@ -840,7 +837,7 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     // Idempotencia — si ya existe este UUID, no procesar de nuevo
     const existing = await query(
-      'SELECT estado, tipo, odoo_ref FROM outbox WHERE client_uuid = $1',
+      'SELECT estado, tipo, odoo_ref, updated_at FROM outbox WHERE client_uuid = $1',
       [client_uuid]
     )
     if (existing.rows.length) {
@@ -883,6 +880,11 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         tipo === 'VISIT_COMPLETED' &&
         (existingRow.tipo !== 'VISIT_COMPLETED' || existingRow.estado !== 'DONE' || !existingRow.odoo_ref || existingRow.odoo_ref === 'local')
       ) {
+        if (existingRow.estado === 'SENDING' && Date.now() - new Date(existingRow.updated_at).getTime() < 2 * 60 * 1000) {
+          results.push({ client_uuid, status: 'SENDING', skipped: true })
+          continue
+        }
+
         try {
           await query(
             `UPDATE outbox
