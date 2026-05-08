@@ -1,6 +1,6 @@
 require('dotenv').config()
 
-const fastify = require('fastify')({ logger: true })
+const fastify = require('fastify')({ logger: true, bodyLimit: 25 * 1024 * 1024 })
 const axios = require('axios').create({ proxy: false })
 const bcrypt = require('bcrypt')
 const crypto = require('crypto')
@@ -226,8 +226,9 @@ async function drainOutboxBacklog(limit = 20) {
         ORDER BY
           CASE tipo
             WHEN 'ORDER_CREATED' THEN 0
-            WHEN 'VISIT_CHECKIN' THEN 1
-            WHEN 'VISIT_CLOSED' THEN 2
+            WHEN 'VISIT_COMPLETED' THEN 1
+            WHEN 'VISIT_CHECKIN' THEN 2
+            WHEN 'VISIT_CLOSED' THEN 3
             ELSE 3
           END,
           created_at ASC
@@ -257,6 +258,8 @@ async function drainOutboxBacklog(limit = 20) {
         let task
         if (row.tipo === 'ORDER_CREATED') {
           task = processOrder(job, odooPost)
+        } else if (row.tipo === 'VISIT_COMPLETED') {
+          task = processVisit(job, odooPost)
         } else if (row.tipo === 'VISIT_CHECKIN' || row.tipo === 'VISIT_CLOSED') {
           await query(
             `UPDATE outbox SET estado = 'DONE', odoo_ref = 'local', updated_at = NOW()
@@ -837,7 +840,7 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     // Idempotencia — si ya existe este UUID, no procesar de nuevo
     const existing = await query(
-      'SELECT estado, tipo FROM outbox WHERE client_uuid = $1',
+      'SELECT estado, tipo, odoo_ref FROM outbox WHERE client_uuid = $1',
       [client_uuid]
     )
     if (existing.rows.length) {
@@ -847,7 +850,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         try {
           await query(
             `UPDATE outbox
-               SET estado = 'SENDING', payload = $1, error_msg = NULL, updated_at = NOW()
+               SET tipo = 'VISIT_COMPLETED', estado = 'SENDING', payload = $1,
+                   error_msg = NULL, updated_at = NOW()
              WHERE client_uuid = $2`,
             [JSON.stringify(payload), client_uuid]
           )
@@ -870,6 +874,36 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
             [err.message, client_uuid]
           )
           fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: ${err.stack || err.message}`)
+          results.push({ client_uuid, status: 'FAILED', error: err.message })
+        }
+        continue
+      }
+
+      if (
+        tipo === 'VISIT_COMPLETED' &&
+        (existingRow.tipo !== 'VISIT_COMPLETED' || existingRow.estado !== 'DONE' || !existingRow.odoo_ref || existingRow.odoo_ref === 'local')
+      ) {
+        try {
+          await query(
+            `UPDATE outbox
+               SET estado = 'SENDING', payload = $1, error_msg = NULL, updated_at = NOW()
+             WHERE client_uuid = $2`,
+            [JSON.stringify(payload), client_uuid]
+          )
+          const result = await processVisit(
+            { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+            odooPost
+          )
+          results.push({ client_uuid, status: result.status || 'DONE', odoo_visit_id: result.odoo_visit_id })
+        } catch (err) {
+          await query(
+            `UPDATE outbox
+               SET estado = 'FAILED', retry_count = retry_count + 1,
+                   error_msg = $1, updated_at = NOW()
+             WHERE client_uuid = $2`,
+            [err.message, client_uuid]
+          )
+          fastify.log.error(`[SYNC_PUSH] VISIT_COMPLETED ${client_uuid}: ${err.stack || err.message}`)
           results.push({ client_uuid, status: 'FAILED', error: err.message })
         }
         continue
@@ -903,17 +937,20 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
          VALUES ($1, $2, $3, $4, $5) ON CONFLICT (client_uuid) DO NOTHING`,
         [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.total || 0, payload.notas || null]
       )
-    } else if (tipo === 'VISIT_CHECKIN') {
+    } else if (tipo === 'VISIT_CHECKIN' || tipo === 'VISIT_COMPLETED') {
       // Usar client_uuid como uuid de la visita — el worker lo busca por este campo
       await query(
-        `INSERT INTO visitas (uuid, vendedor_id, cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at, estado)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'abierta') ON CONFLICT (uuid) DO NOTHING`,
+        `INSERT INTO visitas (uuid, vendedor_id, cliente_odoo_id, parada_id, checkin_lat, checkin_lng, checkin_at, checkout_at, notas, estado)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (uuid) DO NOTHING`,
         [
           client_uuid, vendedor_id, payload.cliente_odoo_id,
           payload.parada_id || null,
           payload.checkin_lat || null,
           payload.checkin_lng || null,
-          payload.checkin_at || null
+          payload.checkin_at || null,
+          payload.checkout_at || null,
+          payload.notas || null,
+          tipo === 'VISIT_COMPLETED' ? 'cerrada' : 'abierta'
         ]
       )
     }
@@ -939,6 +976,32 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           [err.message, client_uuid]
         )
         fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: ${err.stack || err.message}`)
+        results.push({ client_uuid, status: 'FAILED', error: err.message })
+        continue
+      }
+    }
+
+    if (tipo === 'VISIT_COMPLETED') {
+      try {
+        await query(
+          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW() WHERE client_uuid = $1`,
+          [client_uuid]
+        )
+        const result = await processVisit(
+          { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+          odooPost
+        )
+        results.push({ client_uuid, status: result.status || 'DONE', odoo_visit_id: result.odoo_visit_id })
+        continue
+      } catch (err) {
+        await query(
+          `UPDATE outbox
+             SET estado = 'FAILED', retry_count = retry_count + 1,
+                 error_msg = $1, updated_at = NOW()
+           WHERE client_uuid = $2`,
+          [err.message, client_uuid]
+        )
+        fastify.log.error(`[SYNC_PUSH] VISIT_COMPLETED ${client_uuid}: ${err.stack || err.message}`)
         results.push({ client_uuid, status: 'FAILED', error: err.message })
         continue
       }

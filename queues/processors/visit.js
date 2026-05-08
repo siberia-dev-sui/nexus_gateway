@@ -20,6 +20,44 @@ async function processVisit(job, odooPost) {
   )
   const vendorNexusUuid = vendorRow.rows[0]?.vendor_uuid || null
 
+  if (tipo === 'VISIT_COMPLETED') {
+    const result = await odooPost('/nexus/api/v1/create_visit', {
+      nexus_uuid:        clientUuid,
+      tipo:              'VISIT_COMPLETED',
+      cliente_odoo_id,
+      vendor_nexus_uuid: vendorNexusUuid,
+      company_id:        payload.company_id || null,
+      checkin_at:        checkin_at || null,
+      checkin_lat:       checkin_lat || null,
+      checkin_lng:       checkin_lng || null,
+      checkout_at:       payload.checkout_at || null,
+      checkout_lat:      payload.checkout_lat || null,
+      checkout_lng:      payload.checkout_lng || null,
+      notas:             notas || null,
+      inventory_lines:   payload.inventory_lines || [],
+      return_lines:      payload.return_lines || [],
+      merch_tasks:       payload.merch_tasks || [],
+      promotions:        payload.promotions || [],
+      photos:            payload.photos || [],
+      order_uuid:        payload.order_uuid || null,
+    })
+
+    await query(
+      `UPDATE visitas
+          SET estado = 'cerrada', checkout_at = $1, notas = $2
+        WHERE uuid = $3`,
+      [payload.checkout_at || null, notas || null, clientUuid]
+    )
+    await query(
+      `UPDATE outbox SET estado = 'DONE', odoo_ref = $1, updated_at = NOW()
+       WHERE client_uuid = $2`,
+      [String(result.visit_id), clientUuid]
+    )
+
+    console.log(`[VISIT] ✅ COMPLETED ${clientUuid} → Odoo visit ID: ${result.visit_id}`)
+    return { status: 'DONE', odoo_visit_id: result.visit_id }
+  }
+
   // ── VISIT_CHECKIN ─────────────────────────────────────
   if (tipo === 'VISIT_CHECKIN') {
     const ts = checkin_at || new Date().toISOString()
