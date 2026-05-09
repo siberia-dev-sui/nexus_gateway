@@ -65,7 +65,7 @@ async function validateAndReserve({ orderUuid, vendorId, warehouseId, lines }) {
       `SELECT product_id, COALESCE(SUM(quantity), 0) AS reserved
          FROM reservations
         WHERE warehouse_id = $1
-          AND status IN ('pending', 'confirmed')
+          AND status IN ('pending', 'confirmed', 'deducted_pending_sync')
           AND product_id = ANY($2::int[])
         GROUP BY product_id`,
       [warehouseId, productIds]
@@ -195,12 +195,6 @@ async function confirmReservations(orderUuid, acceptedLines = null) {
         )
       }
 
-      await client.query(
-        `UPDATE stock_levels
-            SET updated_at = NOW()
-          WHERE product_id = $1 AND warehouse_id = $2`,
-        [row.product_id, row.warehouse_id]
-      )
     }
 
     await client.query('COMMIT')
@@ -280,8 +274,57 @@ async function reconcileConfirmedReservations(orderUuid, confirmedLines) {
   }
 }
 
-async function releaseActiveReservations(orderUuid, reason = null, options = {}) {
-  const { decrementStock = false } = options
+async function activeReservationsCoveredByStockSync(orderUuid, syncedAfter) {
+  if (!syncedAfter) return false
+
+  const result = await query(
+    `SELECT COUNT(*) AS pending_count
+       FROM reservations r
+       LEFT JOIN stock_levels sl
+         ON sl.product_id = r.product_id
+        AND sl.warehouse_id = r.warehouse_id
+      WHERE r.order_uuid = $1
+        AND r.status IN ('pending', 'confirmed', 'deducted_pending_sync')
+        AND (sl.updated_at IS NULL OR sl.updated_at < $2::timestamptz)`,
+    [orderUuid, syncedAfter]
+  )
+
+  return parseInt(result.rows[0]?.pending_count || 0, 10) === 0
+}
+
+async function markReservationsAwaitingStockSync(orderUuid, syncedAfter) {
+  const result = await query(
+    `UPDATE reservations
+        SET status = 'deducted_pending_sync', resolved_at = $2::timestamptz
+      WHERE order_uuid = $1 AND status IN ('pending', 'confirmed')`,
+    [orderUuid, syncedAfter]
+  )
+  return result.rowCount
+}
+
+async function releaseDeductedReservationsCoveredByStockSync(items) {
+  if (!Array.isArray(items) || !items.length) return 0
+
+  const productIds = [...new Set(items.map((item) => parseInt(item.product_id, 10)).filter(Boolean))]
+  const warehouseIds = [...new Set(items.map((item) => parseInt(item.warehouse_id, 10)).filter(Boolean))]
+  if (!productIds.length || !warehouseIds.length) return 0
+
+  const result = await query(
+    `UPDATE reservations r
+        SET status = 'failed', resolved_at = NOW()
+       FROM stock_levels sl
+      WHERE r.status = 'deducted_pending_sync'
+        AND r.product_id = sl.product_id
+        AND r.warehouse_id = sl.warehouse_id
+        AND r.product_id = ANY($1::int[])
+        AND r.warehouse_id = ANY($2::int[])
+        AND sl.updated_at >= r.resolved_at`,
+    [productIds, warehouseIds]
+  )
+  return result.rowCount
+}
+
+async function releaseActiveReservations(orderUuid, reason = null) {
   const client = await pool.connect()
   let result
   try {
@@ -289,28 +332,18 @@ async function releaseActiveReservations(orderUuid, reason = null, options = {})
     result = await client.query(
       `UPDATE reservations
           SET status = 'failed', resolved_at = NOW()
-        WHERE order_uuid = $1 AND status IN ('pending', 'confirmed')
+        WHERE order_uuid = $1 AND status IN ('pending', 'confirmed', 'deducted_pending_sync')
         RETURNING product_id, warehouse_id, quantity`,
       [orderUuid]
     )
 
     for (const row of result.rows) {
-      const qty = parseFloat(row.quantity || 0)
-      if (decrementStock && qty > 0) {
-        await client.query(
-          `UPDATE stock_levels
-              SET quantity = GREATEST(quantity - $1, 0), updated_at = NOW()
-            WHERE product_id = $2 AND warehouse_id = $3`,
-          [qty, row.product_id, row.warehouse_id]
-        )
-      } else {
-        await client.query(
-          `UPDATE stock_levels
-              SET updated_at = NOW()
-            WHERE product_id = $1 AND warehouse_id = $2`,
-          [row.product_id, row.warehouse_id]
-        )
-      }
+      await client.query(
+        `UPDATE stock_levels
+            SET updated_at = NOW()
+          WHERE product_id = $1 AND warehouse_id = $2`,
+        [row.product_id, row.warehouse_id]
+      )
     }
 
     await client.query('COMMIT')
@@ -384,6 +417,9 @@ module.exports = {
   validateAndReserve,
   confirmReservations,
   reconcileConfirmedReservations,
+  activeReservationsCoveredByStockSync,
+  markReservationsAwaitingStockSync,
+  releaseDeductedReservationsCoveredByStockSync,
   releaseActiveReservations,
   failReservations,
   expireOldReservations,

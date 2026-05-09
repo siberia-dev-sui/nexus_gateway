@@ -1,4 +1,5 @@
 const { query, redis } = require('../db')
+const { releaseDeductedReservationsCoveredByStockSync } = require('./stock_reservations')
 
 // ─────────────────────────────────────────
 // Cron: sync stock por almacén desde módulo nexus_mobile → PostgreSQL
@@ -103,6 +104,10 @@ async function syncStock(odooPost, options = {}) {
   let synced
   try {
     synced = await bulkUpsertStock(items)
+    const released = await releaseDeductedReservationsCoveredByStockSync(items)
+    if (released > 0) {
+      console.log(`${tag} ${released} reserva(s) liberadas tras sync de on-hand Odoo`)
+    }
   } catch (err) {
     console.error(`${tag} Error al UPSERT:`, err.message)
     return { synced: 0, errores: 1 }

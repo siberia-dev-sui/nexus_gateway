@@ -43,11 +43,11 @@ CREATE TABLE IF NOT EXISTS reservations (
   vendor_id       INTEGER REFERENCES vendedores(id),
   order_uuid      UUID NOT NULL,                  -- client_uuid del outbox / sale.order
   quantity        NUMERIC(16,4) NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'pending', -- pending | confirmed | failed | expired
+  status          TEXT NOT NULL DEFAULT 'pending', -- pending | confirmed | deducted_pending_sync | failed | expired
   created_at      TIMESTAMPTZ DEFAULT NOW(),
   resolved_at     TIMESTAMPTZ,                    -- cuándo dejó de ser 'pending'
   CONSTRAINT reservations_status_chk
-    CHECK (status IN ('pending', 'confirmed', 'failed', 'expired'))
+    CHECK (status IN ('pending', 'confirmed', 'deducted_pending_sync', 'failed', 'expired'))
 );
 
 -- Cálculo de disponible: SUM(quantity) WHERE status='pending' por (product, warehouse)

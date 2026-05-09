@@ -18,6 +18,8 @@ const {
   validateAndReserve,
   failReservations,
   reconcileConfirmedReservations,
+  activeReservationsCoveredByStockSync,
+  markReservationsAwaitingStockSync,
   releaseActiveReservations,
   expireOldReservations,
 } = require('./crons/stock_reservations')
@@ -170,9 +172,16 @@ async function reconcileOrdersFromOdooOrders(orders) {
       if (state === 'sale' || state === 'done') {
         await confirmReservations(uuid, order.lines)
         await reconcileConfirmedReservations(uuid, order.lines)
-        const released = await releaseActiveReservations(uuid, 'odoo_confirmed', { decrementStock: true })
-        if (released > 0) {
-          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); Odoo ya descuenta inventario`)
+        const syncedAfter = order.write_date || order.date_order
+        const stockAlreadySynced = await activeReservationsCoveredByStockSync(uuid, syncedAfter)
+        if (stockAlreadySynced) {
+          const released = await releaseActiveReservations(uuid, 'odoo_confirmed_stock_synced')
+          if (released > 0) {
+            fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); stock Odoo ya sincronizado`)
+          }
+        } else {
+          const marked = await markReservationsAwaitingStockSync(uuid, syncedAfter)
+          fastify.log.info(`[RESERVATIONS] ${uuid}: pedido confirmado en Odoo; ${marked} reserva(s) esperan próximo sync_stock`)
         }
       } else if (state === 'draft' || state === 'sent') {
         const adjusted = await reconcileConfirmedReservations(uuid, order.lines)
@@ -671,7 +680,7 @@ fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (reques
     LEFT JOIN (
       SELECT product_id, warehouse_id, SUM(quantity) AS reserved
         FROM reservations
-       WHERE warehouse_id = $1 AND status IN ('pending', 'confirmed')
+       WHERE warehouse_id = $1 AND status IN ('pending', 'confirmed', 'deducted_pending_sync')
        GROUP BY product_id, warehouse_id
     ) r ON r.product_id = sl.product_id AND r.warehouse_id = sl.warehouse_id
     WHERE sl.warehouse_id = $1
