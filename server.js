@@ -17,6 +17,8 @@ const { syncStock } = require('./crons/sync_stock')
 const {
   validateAndReserve,
   failReservations,
+  reconcileConfirmedReservations,
+  releaseActiveReservations,
   expireOldReservations,
 } = require('./crons/stock_reservations')
 const { generateRoutes } = require('./crons/generate_routes')
@@ -154,6 +156,39 @@ function catalogCacheKey(productIds = null) {
   const sorted = [...new Set(productIds.map(Number))].sort((a, b) => a - b)
   const hash = crypto.createHash('sha1').update(sorted.join(',')).digest('hex')
   return `catalog:products:${hash}`
+}
+
+async function reconcileOrdersFromOdooOrders(orders) {
+  if (!Array.isArray(orders) || !orders.length) return
+
+  for (const order of orders) {
+    const uuid = order?.client_order_ref
+    const state = order?.state
+    if (!uuid || !Array.isArray(order.lines)) continue
+
+    try {
+      if (state === 'sale' || state === 'done') {
+        await confirmReservations(uuid, order.lines)
+        await reconcileConfirmedReservations(uuid, order.lines)
+        const released = await releaseActiveReservations(uuid, 'odoo_confirmed', { decrementStock: true })
+        if (released > 0) {
+          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); Odoo ya descuenta inventario`)
+        }
+      } else if (state === 'draft' || state === 'sent') {
+        const adjusted = await reconcileConfirmedReservations(uuid, order.lines)
+        if (adjusted > 0) {
+          fastify.log.info(`[RESERVATIONS] ${uuid}: ${adjusted} línea(s) ajustada(s) contra borrador Odoo`)
+        }
+      } else if (state === 'cancel') {
+        const released = await releaseActiveReservations(uuid, 'odoo_cancelled')
+        if (released > 0) {
+          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s) por cancelación Odoo`)
+        }
+      }
+    } catch (err) {
+      fastify.log.error(`[RESERVATIONS] ${uuid}: error reconciliando contra Odoo: ${err.message}`)
+    }
+  }
 }
 
 async function getCatalog(productIds = null) {
@@ -574,6 +609,8 @@ fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, rep
   })
   if (!result) return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
 
+  await reconcileOrdersFromOdooOrders(result.orders || [])
+
   return {
     status: 'ok',
     orders: result.orders || [],
@@ -626,18 +663,27 @@ fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (reques
   }
 
   let sql = `
-    SELECT product_id, quantity, updated_at
-    FROM stock_levels
-    WHERE warehouse_id = $1
+    SELECT
+      sl.product_id,
+      GREATEST(sl.quantity - COALESCE(r.reserved, 0), 0) AS quantity,
+      sl.updated_at
+    FROM stock_levels sl
+    LEFT JOIN (
+      SELECT product_id, warehouse_id, SUM(quantity) AS reserved
+        FROM reservations
+       WHERE warehouse_id = $1 AND status IN ('pending', 'confirmed')
+       GROUP BY product_id, warehouse_id
+    ) r ON r.product_id = sl.product_id AND r.warehouse_id = sl.warehouse_id
+    WHERE sl.warehouse_id = $1
   `
   const params = [warehouseId]
 
   if (since) {
-    sql += ' AND updated_at > $2'
+    sql += ' AND sl.updated_at > $2'
     params.push(since)
   }
 
-  sql += ' ORDER BY product_id'
+  sql += ' ORDER BY sl.product_id'
 
   let rows
   try {

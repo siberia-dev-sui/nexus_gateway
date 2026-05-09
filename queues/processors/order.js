@@ -146,7 +146,7 @@ async function processOrder(job, odooPost) {
 
   // Odoo aceptó el pedido: las reservas pending pasan a confirmed.
   // El stock comprometido en gateway queda permanentemente descontado.
-  await confirmReservations(clientUuid)
+  await confirmReservations(clientUuid, result.lines || result.accepted_lines || null)
 
   console.log(
     `[ORDER] ✅ ${clientUuid} → Odoo ${orderName} (ID: ${orderId})` +
