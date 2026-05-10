@@ -18,8 +18,6 @@ const {
   validateAndReserve,
   failReservations,
   reconcileConfirmedReservations,
-  activeReservationsCoveredByStockSync,
-  markReservationsAwaitingStockSync,
   releaseActiveReservations,
   expireOldReservations,
 } = require('./crons/stock_reservations')
@@ -172,16 +170,9 @@ async function reconcileOrdersFromOdooOrders(orders) {
       if (state === 'sale' || state === 'done') {
         await confirmReservations(uuid, order.lines)
         await reconcileConfirmedReservations(uuid, order.lines)
-        const syncedAfter = order.write_date || order.date_order
-        const stockAlreadySynced = await activeReservationsCoveredByStockSync(uuid, syncedAfter)
-        if (stockAlreadySynced) {
-          const released = await releaseActiveReservations(uuid, 'odoo_confirmed_stock_synced')
-          if (released > 0) {
-            fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); stock Odoo ya sincronizado`)
-          }
-        } else {
-          const marked = await markReservationsAwaitingStockSync(uuid, syncedAfter)
-          fastify.log.info(`[RESERVATIONS] ${uuid}: pedido confirmado en Odoo; ${marked} reserva(s) esperan próximo sync_stock`)
+        const released = await releaseActiveReservations(uuid, 'odoo_confirmed')
+        if (released > 0) {
+          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); Odoo confirmado`)
         }
       } else if (state === 'draft' || state === 'sent') {
         const adjusted = await reconcileConfirmedReservations(uuid, order.lines)
