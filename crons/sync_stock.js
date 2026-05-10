@@ -1,5 +1,8 @@
 const { query, redis } = require('../db')
-const { releaseDeductedReservationsCoveredByStockSync } = require('./stock_reservations')
+const {
+  releaseActiveReservations,
+  releaseDeductedReservationsCoveredByStockSync,
+} = require('./stock_reservations')
 
 // ─────────────────────────────────────────
 // Cron: sync stock por almacén desde módulo nexus_mobile → PostgreSQL
@@ -58,6 +61,50 @@ async function bulkUpsertStock(items) {
   return synced
 }
 
+async function reconcileActiveReservationsFromOdoo(odooPost, items, tag) {
+  const productIds = [...new Set(items.map((item) => parseInt(item.product_id, 10)).filter(Boolean))]
+  const warehouseIds = [...new Set(items.map((item) => parseInt(item.warehouse_id, 10)).filter(Boolean))]
+  if (!productIds.length || !warehouseIds.length) return 0
+
+  const active = await query(
+    `SELECT DISTINCT r.order_uuid, v.uuid AS vendor_nexus_uuid
+       FROM reservations r
+       LEFT JOIN vendedores v ON v.id = r.vendor_id
+      WHERE r.status IN ('confirmed', 'deducted_pending_sync')
+        AND r.product_id = ANY($1::int[])
+        AND r.warehouse_id = ANY($2::int[])
+        AND v.uuid IS NOT NULL
+      LIMIT 100`,
+    [productIds, warehouseIds]
+  )
+
+  let released = 0
+  for (const row of active.rows) {
+    const orderUuid = String(row.order_uuid)
+    try {
+      const result = await odooPost('/nexus/api/v1/vendor_orders', {
+        vendor_nexus_uuid: row.vendor_nexus_uuid,
+        limit: 1,
+        offset: 0,
+        search: orderUuid,
+      })
+      const order = (result?.orders || []).find((item) => item.client_order_ref === orderUuid)
+      if (!order) continue
+
+      if (order.state === 'sale' || order.state === 'done' || order.state === 'cancel') {
+        released += await releaseActiveReservations(
+          orderUuid,
+          order.state === 'cancel' ? 'odoo_cancelled_stock_sync' : 'odoo_confirmed_stock_sync'
+        )
+      }
+    } catch (err) {
+      console.error(`${tag} No se pudo reconciliar reserva ${orderUuid}:`, err.message)
+    }
+  }
+
+  return released
+}
+
 /**
  * Sincroniza stock con Odoo en modo delta o full.
  *
@@ -107,6 +154,10 @@ async function syncStock(odooPost, options = {}) {
     const released = await releaseDeductedReservationsCoveredByStockSync(items)
     if (released > 0) {
       console.log(`${tag} ${released} reserva(s) liberadas tras sync de on-hand Odoo`)
+    }
+    const reconciled = await reconcileActiveReservationsFromOdoo(odooPost, items, tag)
+    if (reconciled > 0) {
+      console.log(`${tag} ${reconciled} reserva(s) activas liberadas tras confirmar estado en Odoo`)
     }
   } catch (err) {
     console.error(`${tag} Error al UPSERT:`, err.message)
