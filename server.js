@@ -1304,7 +1304,7 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
 // GET estado de eventos del outbox
 fastify.get('/api/v1/sync/status', { preHandler: [verifyToken] }, async (request, reply) => {
-  const { vendedor_id } = request.user
+  const { vendedor_id, uuid: vendorNexusUuid } = request.user
   const { uuids } = request.query
 
   if (!uuids) return reply.code(400).send({ error: 'uuids requerido (comma-separated)' })
@@ -1316,7 +1316,34 @@ fastify.get('/api/v1/sync/status', { preHandler: [verifyToken] }, async (request
     [uuidList, vendedor_id]
   )
 
-  return { status: 'ok', events: result.rows }
+  const events = []
+  for (const row of result.rows) {
+    const event = { ...row }
+
+    if (event.tipo === 'ORDER_CREATED' && event.estado === 'DONE') {
+      try {
+        const orderResult = await odooPost('/nexus/api/v1/vendor_orders', {
+          vendor_nexus_uuid: vendorNexusUuid,
+          limit: 1,
+          offset: 0,
+          search: event.client_uuid,
+        })
+        const order = (orderResult?.orders || []).find((item) => item.client_order_ref === event.client_uuid)
+        if (order) {
+          event.estado = order.state || event.estado
+          event.odoo_ref = order.name || event.odoo_ref
+          event.odoo_order_id = order.id || null
+          await reconcileOrdersFromOdooOrders([order])
+        }
+      } catch (err) {
+        fastify.log.error(`[SYNC_STATUS] ${event.client_uuid}: no se pudo leer estado Odoo: ${err.message}`)
+      }
+    }
+
+    events.push(event)
+  }
+
+  return { status: 'ok', events }
 })
 
 // ── UBICACIONES ──────────────────────────
