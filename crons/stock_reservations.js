@@ -312,13 +312,9 @@ async function releaseDeductedReservationsCoveredByStockSync(items) {
   const result = await query(
     `UPDATE reservations r
         SET status = 'failed', resolved_at = NOW()
-       FROM stock_levels sl
       WHERE r.status = 'deducted_pending_sync'
-        AND r.product_id = sl.product_id
-        AND r.warehouse_id = sl.warehouse_id
         AND r.product_id = ANY($1::int[])
-        AND r.warehouse_id = ANY($2::int[])
-        AND sl.updated_at >= r.resolved_at`,
+        AND r.warehouse_id = ANY($2::int[])`,
     [productIds, warehouseIds]
   )
   return result.rowCount
