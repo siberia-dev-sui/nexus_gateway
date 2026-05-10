@@ -200,6 +200,36 @@ async function reconcileOrdersFromOdooOrders(orders) {
   }
 }
 
+async function reconcileActiveReservationsForVendorWarehouse(vendorNexusUuid, vendorId, warehouseId) {
+  const active = await query(
+    `SELECT DISTINCT order_uuid
+       FROM reservations
+      WHERE vendor_id = $1
+        AND warehouse_id = $2
+        AND status IN ('confirmed', 'deducted_pending_sync')
+      ORDER BY order_uuid
+      LIMIT 50`,
+    [vendorId, warehouseId]
+  )
+
+  if (!active.rows.length) return
+
+  for (const row of active.rows) {
+    const orderUuid = String(row.order_uuid)
+    try {
+      const result = await odooPost('/nexus/api/v1/vendor_orders', {
+        vendor_nexus_uuid: vendorNexusUuid,
+        limit: 1,
+        offset: 0,
+        search: orderUuid,
+      })
+      await reconcileOrdersFromOdooOrders(result?.orders || [])
+    } catch (err) {
+      fastify.log.error(`[RESERVATIONS] ${orderUuid}: no se pudo reconciliar antes de stock: ${err.message}`)
+    }
+  }
+}
+
 async function getCatalog(productIds = null) {
   const key = catalogCacheKey(productIds)
   const cached = await redis.get(key)
@@ -661,6 +691,7 @@ fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (re
 // en POST /api/v1/orders al confirmar el pedido.
 
 fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid: vendorNexusUuid, vendedor_id: vendorId } = request.user
   const warehouseIdRaw = request.query.warehouse_id
   const since          = request.query.since  // ISO 8601 opcional
 
@@ -670,6 +701,8 @@ fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (reques
       error: 'warehouse_id requerido y debe ser un entero positivo'
     })
   }
+
+  await reconcileActiveReservationsForVendorWarehouse(vendorNexusUuid, vendorId, warehouseId)
 
   let sql = `
     SELECT
