@@ -14,6 +14,7 @@ const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncClients, syncVendorClients } = require('./crons/sync_clients')
 const { syncStock } = require('./crons/sync_stock')
+const { syncPaymentJournals } = require('./crons/sync_payment_journals')
 const {
   validateAndReserve,
   failReservations,
@@ -739,6 +740,156 @@ fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (reques
     count:        items.length,
     synced_at:    new Date().toISOString(),
     items,
+  }
+})
+
+// ── DIARIOS DE PAGO (lista en cache, alimentada por sync_payment_journals) ──
+
+fastify.get('/api/v1/vendor/journals', { preHandler: [verifyToken] }, async (request, reply) => {
+  const companyIdRaw = request.query.company_id
+  const companyId = parseInt(companyIdRaw, 10)
+
+  let sql = `
+    SELECT id, company_id, company_name, name, code, type, currency_code
+      FROM payment_journals
+  `
+  const params = []
+  if (companyId && !Number.isNaN(companyId)) {
+    sql += ' WHERE company_id = $1'
+    params.push(companyId)
+  }
+  sql += ' ORDER BY company_name, name'
+
+  let rows
+  try {
+    const result = await query(sql, params)
+    rows = result.rows
+  } catch (err) {
+    fastify.log.error(`[GET /vendor/journals] Error: ${err.message}`)
+    return reply.code(500).send({ error: 'Error al consultar diarios' })
+  }
+
+  return {
+    status:   'ok',
+    count:    rows.length,
+    journals: rows,
+  }
+})
+
+// ── FACTURAS PENDIENTES DE UN CLIENTE (proxy a Odoo, sin cache) ─────────────
+
+fastify.get('/api/v1/clients/:id/invoices', { preHandler: [verifyToken] }, async (request, reply) => {
+  const partnerId = parseInt(request.params.id, 10)
+  const companyId = parseInt(request.query.company_id, 10)
+
+  if (!partnerId || Number.isNaN(partnerId)) {
+    return reply.code(400).send({ error: 'partner_id (en la URL) inválido' })
+  }
+  if (!companyId || Number.isNaN(companyId)) {
+    return reply.code(400).send({ error: 'company_id es requerido' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/partner_invoices', {
+      partner_id: partnerId,
+      company_id: companyId,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    return {
+      status:   'ok',
+      count:    result?.count || 0,
+      invoices: result?.invoices || [],
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /clients/${partnerId}/invoices] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar facturas en Odoo' })
+  }
+})
+
+// ── SOLICITUDES DE PAGO (online, sin outbox por ahora) ──────────────────────
+
+fastify.post('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid: vendorNexusUuid, vendedor_id: vendorId } = request.user
+  const body = request.body || {}
+
+  const required = ['client_uuid', 'cliente_odoo_id', 'company_id',
+                    'journal_id', 'amount', 'lines']
+  const missing = required.filter((k) =>
+    body[k] === undefined || body[k] === null || body[k] === ''
+  )
+  if (missing.length) {
+    return reply.code(400).send({
+      error: `Faltan campos requeridos: ${missing.join(', ')}`,
+    })
+  }
+  if (!Array.isArray(body.lines) || !body.lines.length) {
+    return reply.code(400).send({ error: 'lines debe ser un array no vacío' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/create_payment_request', {
+      client_uuid:       body.client_uuid,
+      vendor_nexus_uuid: vendorNexusUuid,
+      cliente_odoo_id:   body.cliente_odoo_id,
+      company_id:        body.company_id,
+      journal_id:        body.journal_id,
+      amount:            body.amount,
+      date:              body.date || null,
+      payment_reference: body.payment_reference || null,
+      attachment_b64:    body.attachment_b64 || null,
+      attachment_name:   body.attachment_name || null,
+      device_id:         body.device_id || null,
+      lines:             body.lines,
+    })
+
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+
+    fastify.log.info(
+      `[PAYMENT_REQUEST] ${result.created ? 'created' : 'idempotent'} ` +
+      `${result.name} vendor=${vendorNexusUuid?.slice(0, 8)} ` +
+      `partner=${body.cliente_odoo_id}`
+    )
+    return {
+      status:               'ok',
+      created:              result.created || false,
+      payment_request_id:   result.payment_request_id,
+      nexus_id:             result.nexus_id,
+      name:                 result.name,
+    }
+  } catch (err) {
+    fastify.log.error(`[POST /payment_requests] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo crear la solicitud en Odoo' })
+  }
+})
+
+fastify.get('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid: vendorNexusUuid } = request.user
+  const limit = Math.min(parseInt(request.query.limit, 10) || 30, 100)
+  const offset = Math.max(parseInt(request.query.offset, 10) || 0, 0)
+  const state = request.query.state || null
+
+  try {
+    const result = await odooPost('/nexus/api/v1/vendor_payment_requests', {
+      vendor_nexus_uuid: vendorNexusUuid,
+      limit,
+      offset,
+      state,
+    })
+    return {
+      status:   'ok',
+      count:    result?.count || 0,
+      total:    result?.total || 0,
+      limit,
+      offset,
+      requests: result?.requests || [],
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /payment_requests] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar solicitudes en Odoo' })
   }
 })
 
@@ -1775,6 +1926,21 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   runStockFull()
   setInterval(runStockDelta, STOCK_DELTA_INTERVAL)
   setInterval(runStockFull, STOCK_FULL_INTERVAL)
+
+  // ── Cron: sync diarios de pago desde Odoo (cada 6 horas) ─────
+  const JOURNALS_SYNC_INTERVAL = 6 * 60 * 60 * 1000
+
+  async function runJournalsSync() {
+    try {
+      const result = await syncPaymentJournals(odooPost)
+      fastify.log.info(`[SYNC_JOURNALS] synced=${result.synced || 0}`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_JOURNALS] Error: ${e.message}`)
+    }
+  }
+
+  runJournalsSync()
+  setInterval(runJournalsSync, JOURNALS_SYNC_INTERVAL)
 
   // ── Cron: expirar reservas pending viejas ─────────────────────
   // Si el worker crashea entre crear la reserva y procesarla en Odoo, la
