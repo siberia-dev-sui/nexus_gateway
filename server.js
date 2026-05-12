@@ -776,6 +776,36 @@ fastify.get('/api/v1/vendor/journals', { preHandler: [verifyToken] }, async (req
   }
 })
 
+// ── TASA DE CAMBIO POR FECHA (proxy a Odoo, sin cache) ──────────────────────
+
+fastify.get('/api/v1/exchange_rate', { preHandler: [verifyToken] }, async (request, reply) => {
+  const date = request.query.date  // ISO 8601 opcional
+  const companyId = parseInt(request.query.company_id, 10)
+
+  if (!companyId || Number.isNaN(companyId)) {
+    return reply.code(400).send({ error: 'company_id es requerido' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/exchange_rate', {
+      date: date || null,
+      company_id: companyId,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    return {
+      status:        'ok',
+      date:          result.date,
+      rate:          result.rate,
+      currency_code: result.currency_code,
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /exchange_rate] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar tasa en Odoo' })
+  }
+})
+
 // ── FACTURAS PENDIENTES DE UN CLIENTE (proxy a Odoo, sin cache) ─────────────
 
 fastify.get('/api/v1/clients/:id/invoices', { preHandler: [verifyToken] }, async (request, reply) => {
