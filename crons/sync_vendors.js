@@ -7,13 +7,17 @@ const { query } = require('../db')
 //
 // El módulo es la fuente de verdad de los vendedores (nexus.vendor en Odoo).
 // Endpoint: POST /nexus/api/v1/get_vendors → { vendors: [...] }
-// Campos disponibles: nexus_uuid, nombre, email, telefono, activo, odoo_id
+// Campos: nexus_uuid, nombre, email, telefono, activo, odoo_id, nexus_password.
 //
-// Nota sobre contraseñas: el módulo no expone nexus_password por seguridad.
-// - Vendedores existentes: se actualiza el perfil, la contraseña no cambia.
-// - Vendedores nuevos: se omiten (no se puede crear sin contraseña).
-//   → Lenn debe exponer un endpoint de onboarding o añadir nexus_password al módulo.
+// Contraseñas:
+// - Vendedor nuevo: se hashea nexus_password con bcrypt y se inserta.
+// - Vendedor existente: se actualiza el perfil sin tocar password_hash
+//   (para no invalidar la sesión si alguien rota la contraseña en Odoo).
+//   La regeneración manual desde Odoo no se propaga automáticamente — eso
+//   requeriría un mecanismo de invalidación de sesiones aparte.
 // ─────────────────────────────────────────
+
+const BCRYPT_COST = 10
 
 async function syncVendors(odooPost) {
   console.log('[SYNC_VENDORS] Iniciando sync desde módulo nexus_mobile...')
@@ -80,12 +84,23 @@ async function syncVendors(odooPost) {
         actualizados++
       }
     } else {
-      // Vendedor nuevo sin contraseña — no se puede crear hasta que el módulo exponga nexus_password
-      console.warn(
-        `[SYNC_VENDORS] Vendedor nuevo detectado: ${v.nombre} (${email}) — ` +
-        'omitido: el módulo no expone nexus_password. ' +
-        'Lenn debe añadir nexus_password al endpoint /get_vendors o crear un endpoint de onboarding.'
+      // Vendedor nuevo — hashear nexus_password y crear la fila.
+      if (!v.nexus_password) {
+        console.warn(
+          `[SYNC_VENDORS] Vendedor nuevo ${v.nombre} (${email}) — omitido: ` +
+          'el módulo no devolvió nexus_password (¿está actualizado nexus_mobile?)'
+        )
+        continue
+      }
+      const passwordHash = await bcrypt.hash(v.nexus_password, BCRYPT_COST)
+      await query(
+        `INSERT INTO vendedores (uuid, odoo_vendor_id, nombre, email,
+                                 password_hash, activo)
+         VALUES ($1, $2, $3, $4, $5, true)`,
+        [v.nexus_uuid, v.odoo_id, v.nombre, email, passwordHash]
       )
+      console.log(`[SYNC_VENDORS] Creado: ${v.nombre} (${email})`)
+      creados++
     }
   }
 
