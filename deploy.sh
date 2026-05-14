@@ -9,3 +9,6 @@ for f in db/migrate_*.sql; do
   echo ">> $f"
   docker exec -i nexus_postgres psql -U nexus -d nexus -v ON_ERROR_STOP=1 < "$f"
 done
+
+echo ""
+echo "✅ Deploy realizado correctamente"
