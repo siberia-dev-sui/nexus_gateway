@@ -376,7 +376,7 @@ Muestra por cada vendedor: paradas totales, completadas, saltadas, distancia est
 ## 9. CREDENCIALES Y URLS
 
 ```
-Gateway:         https://77-42-71-221.sslip.io
+Gateway:         https://nexus.eqnio.com
 Vendedor demo:   bot_ventas@leiros.com / 123456
 Odoo staging:    https://equinocciodev-gleiros-19-0-28086660.dev.odoo.com
 Odoo admin:      admin / 12345678

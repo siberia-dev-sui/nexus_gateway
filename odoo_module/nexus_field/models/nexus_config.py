@@ -9,7 +9,7 @@ class NexusConfig(models.Model):
     gateway_url = fields.Char(
         string='URL del Gateway',
         required=True,
-        default='https://77-42-71-221.sslip.io',
+        default='https://nexus.eqnio.com',
         help='URL base del NEXUS API Gateway'
     )
     refresh_interval = fields.Integer(

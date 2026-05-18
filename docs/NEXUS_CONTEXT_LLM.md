@@ -37,7 +37,7 @@ NEXUS Gateway (PostgreSQL propio)
 ### Servidor Hetzner CX22
 ```
 IP:       77.42.71.221
-Dominio:  77-42-71-221.sslip.io
+Dominio:  nexus.eqnio.com
 OS:       Ubuntu 24.04.4 LTS
 Docker:   29.4.0
 Node.js:  v20.20.2
@@ -289,7 +289,7 @@ bull:nexus-outbox:*      → Keys internas de BullMQ (no tocar)
 
 ## 7. API ENDPOINTS ACTIVOS
 
-**Base URL:** `https://77-42-71-221.sslip.io`
+**Base URL:** `https://nexus.eqnio.com`
 
 ### Sin autenticación
 | Método | Endpoint | Descripción |
@@ -503,7 +503,7 @@ class NexusConfig(models.Model):
     _description = 'Configuración NEXUS Gateway'
 
     name            = fields.Char(default='NEXUS Gateway', readonly=True)
-    gateway_url     = fields.Char(default='https://77-42-71-221.sslip.io')
+    gateway_url     = fields.Char(default='https://nexus.eqnio.com')
     refresh_interval = fields.Integer(default=30)   # segundos
     supervisor_token = fields.Char(required=True)   # JWT de supervisor
 ```
