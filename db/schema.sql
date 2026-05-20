@@ -127,6 +127,26 @@ CREATE INDEX IF NOT EXISTS idx_pricelist_sync_queue_status
   ON pricelist_sync_queue(status, requested_at);
 
 -- ─────────────────────────────────────────
+-- CACHE LOCAL DE IMÁGENES DE PRODUCTOS
+-- Fuente: product.product.image_256 en Odoo vía endpoint nexus_mobile.
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS product_images (
+  product_id      INTEGER PRIMARY KEY,
+  default_code    TEXT,
+  write_date      TIMESTAMPTZ,
+  mimetype        TEXT DEFAULT 'image/png',
+  image_data      BYTEA NOT NULL,
+  size_bytes      INTEGER NOT NULL DEFAULT 0,
+  synced_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_images_default_code
+  ON product_images(default_code);
+
+CREATE INDEX IF NOT EXISTS idx_product_images_write_date
+  ON product_images(write_date);
+
+-- ─────────────────────────────────────────
 -- RUTAS
 -- Plan diario generado a las 4AM por cron
 -- ─────────────────────────────────────────

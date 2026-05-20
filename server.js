@@ -14,6 +14,7 @@ const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
 const { syncClients, syncVendorClients } = require('./crons/sync_clients')
 const { syncStock } = require('./crons/sync_stock')
+const { syncProductImages } = require('./crons/sync_product_images')
 const { syncPaymentJournals } = require('./crons/sync_payment_journals')
 const {
   validateAndReserve,
@@ -484,11 +485,14 @@ fastify.post('/api/v1/auth/refresh', async (request, reply) => {
 })
 
 function isAdminTokenValid(request) {
-  const expected = process.env.NEXUS_ADMIN_TOKEN || ''
-  const provided = request.headers['x-nexus-admin-token'] || ''
+  const expected = String(process.env.NEXUS_ADMIN_TOKEN || '').trim()
+  const provided = String(request.headers['x-nexus-admin-token'] || '').trim()
+  if (!expected || !provided || Buffer.byteLength(expected) !== Buffer.byteLength(provided)) {
+    return false
+  }
   return Boolean(expected && provided && crypto.timingSafeEqual(
-    Buffer.from(String(provided)),
-    Buffer.from(String(expected))
+    Buffer.from(provided),
+    Buffer.from(expected)
   ))
 }
 
@@ -504,7 +508,7 @@ async function verifyAdminToken(request, reply) {
 
 const syncLocks = new Map()
 
-async function runGatewaySync(name) {
+async function runGatewaySync(name, options = {}) {
   if (syncLocks.has(name)) return syncLocks.get(name)
 
   const promise = (async () => {
@@ -521,6 +525,8 @@ async function runGatewaySync(name) {
         return syncPaymentJournals(odooPost)
       case 'prices':
         return runPriceBookSyncCycle({ processAll: true })
+      case 'product-images':
+        return syncProductImages(odooPost, options)
       case 'outbox':
         return {
           requeued: await requeueOutboxBacklog(),
@@ -528,8 +534,8 @@ async function runGatewaySync(name) {
         }
       case 'all': {
         const results = {}
-        for (const item of ['vendors', 'clients', 'journals', 'prices', 'stock-delta', 'outbox']) {
-          results[item] = await runGatewaySync(item)
+        for (const item of ['vendors', 'clients', 'journals', 'prices', 'product-images', 'stock-delta', 'outbox']) {
+          results[item] = await runGatewaySync(item, options)
         }
         return results
       }
@@ -560,6 +566,7 @@ fastify.get('/admin/sync', async (_, reply) => {
     h1 { margin-top: 0; }
     label { display: block; margin-bottom: 12px; font-weight: 700; }
     input { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #c8cfda; border-radius: 10px; }
+    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
     button { padding: 12px 14px; border: 0; border-radius: 10px; background: #1646d8; color: white; font-weight: 700; cursor: pointer; }
     button.secondary { background: #2f3b52; }
@@ -571,13 +578,22 @@ fastify.get('/admin/sync', async (_, reply) => {
   <main>
     <h1>NEXUS Gateway Sync</h1>
     <p>Ejecuta sincronizadores manuales sin reiniciar el gateway ni golpear Odoo durante deploy.</p>
-    <label>Admin token</label>
-    <input id="token" type="password" autocomplete="off" placeholder="NEXUS_ADMIN_TOKEN">
+    <div class="fields">
+      <div>
+        <label>Admin token</label>
+        <input id="token" type="password" autocomplete="off" placeholder="NEXUS_ADMIN_TOKEN">
+      </div>
+      <div>
+        <label>Default code opcional</label>
+        <input id="defaultCode" type="text" autocomplete="off" placeholder="SKU específico para imágenes">
+      </div>
+    </div>
     <div class="grid">
       <button data-sync="vendors">Vendedores</button>
       <button data-sync="clients">Clientes</button>
       <button data-sync="journals">Diarios</button>
       <button data-sync="prices">Precios</button>
+      <button data-sync="product-images">Imágenes faltantes</button>
       <button data-sync="stock-delta">Stock delta</button>
       <button class="secondary" data-sync="stock-full">Stock full</button>
       <button data-sync="outbox">Outbox</button>
@@ -591,11 +607,13 @@ fastify.get('/admin/sync', async (_, reply) => {
       button.addEventListener('click', async () => {
         const sync = button.dataset.sync
         const token = document.getElementById('token').value
+        const defaultCode = document.getElementById('defaultCode').value.trim()
         output.textContent = 'Ejecutando ' + sync + '...'
         try {
           const res = await fetch('/api/v1/admin/sync/' + sync, {
             method: 'POST',
-            headers: { 'X-Nexus-Admin-Token': token },
+            headers: { 'X-Nexus-Admin-Token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ default_code: defaultCode || undefined }),
           })
           const data = await res.json()
           output.textContent = JSON.stringify(data, null, 2)
@@ -611,9 +629,10 @@ fastify.get('/admin/sync', async (_, reply) => {
 
 fastify.post('/api/v1/admin/sync/:name', { preHandler: [verifyAdminToken] }, async (request, reply) => {
   const name = String(request.params.name || '')
+  const options = request.body || {}
   const startedAt = Date.now()
   try {
-    const result = await runGatewaySync(name)
+    const result = await runGatewaySync(name, options)
     return { status: 'ok', sync: name, duration_ms: Date.now() - startedAt, result }
   } catch (err) {
     fastify.log.error(`[ADMIN_SYNC] ${name}: ${err.stack || err.message}`)
@@ -631,12 +650,22 @@ fastify.get('/api/v1/catalog', async () => {
 // ── PRODUCT IMAGE ─────────────────────────
 
 fastify.get('/api/v1/product/:id/image', async (request, reply) => {
-  const url = `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_256`
   try {
-    const res = await axios.get(url, { responseType: 'arraybuffer' })
-    reply.header('Content-Type', res.headers['content-type'] || 'image/png')
+    const result = await query(
+      `SELECT mimetype, image_data, write_date
+         FROM product_images
+        WHERE product_id = $1`,
+      [parseInt(request.params.id, 10)]
+    )
+    const image = result.rows[0]
+    if (!image) return reply.code(404).send()
+
+    reply.header('Content-Type', image.mimetype || 'image/png')
     reply.header('Cache-Control', 'public, max-age=86400')
-    return reply.send(Buffer.from(res.data))
+    if (image.write_date) {
+      reply.header('ETag', `"product-${request.params.id}-${new Date(image.write_date).getTime()}"`)
+    }
+    return reply.send(Buffer.from(image.image_data))
   } catch {
     reply.code(404).send()
   }
@@ -2075,6 +2104,23 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   if (AUTO_SYNC_ON_START) runJournalsSync()
   if (ENABLE_SYNC_CRONS) setInterval(runJournalsSync, JOURNALS_SYNC_INTERVAL)
+
+  // ── Cron: cache local de imágenes de productos (cada 12 horas) ─────
+  const PRODUCT_IMAGES_SYNC_INTERVAL = 12 * 60 * 60 * 1000
+
+  async function runProductImagesSync() {
+    try {
+      const result = await syncProductImages(odooPost)
+      if (result.synced > 0 || result.errores) {
+        fastify.log.info(`[SYNC_PRODUCT_IMAGES] synced=${result.synced || 0} errores=${result.errores || 0}`)
+      }
+    } catch (e) {
+      fastify.log.error(`[SYNC_PRODUCT_IMAGES] Error: ${e.message}`)
+    }
+  }
+
+  if (AUTO_SYNC_ON_START) runProductImagesSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runProductImagesSync, PRODUCT_IMAGES_SYNC_INTERVAL)
 
   // ── Cron: expirar reservas pending viejas ─────────────────────
   // Si el worker crashea entre crear la reserva y procesarla en Odoo, la
