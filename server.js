@@ -31,57 +31,23 @@ const {
 } = require('./crons/sync_price_books')
 
 // ─────────────────────────────────────────
-// Odoo client
+// Odoo client: endpoints NEXUS autenticados por token compartido
 // ─────────────────────────────────────────
-let odooSession = null
 
-async function odooAuth() {
-  const res = await axios.post(`${process.env.ODOO_URL}/web/session/authenticate`, {
-    jsonrpc: '2.0',
-    method: 'call',
-    params: {
-      db: process.env.ODOO_DB,
-      login: process.env.ODOO_BOT_EMAIL,
-      password: process.env.ODOO_BOT_PASSWORD
-    }
-  })
-  if (res.data.result && res.data.result.uid) {
-    odooSession = res.headers['set-cookie']
-    return true
-  }
-  throw new Error('Odoo auth failed')
-}
-
-async function odooCall(model, method, args = [], kwargs = {}) {
-  if (!odooSession) await odooAuth()
-  try {
-    const res = await axios.post(
-      `${process.env.ODOO_URL}/web/dataset/call_kw`,
-      { jsonrpc: '2.0', method: 'call', params: { model, method, args, kwargs } },
-      { headers: { Cookie: odooSession.join('; ') } }
-    )
-    if (res.data.error) {
-      odooSession = null
-      await odooAuth()
-      return odooCall(model, method, args, kwargs)
-    }
-    return res.data.result
-  } catch (err) {
-    odooSession = null
-    throw err
-  }
-}
-
-// Helper para endpoints custom del módulo nexus_mobile (no /web/dataset/call_kw)
 async function odooPost(path, params = {}) {
-  if (!odooSession) await odooAuth()
+  if (!process.env.NEXUS_ADMIN_TOKEN) {
+    throw new Error('NEXUS_ADMIN_TOKEN no está configurado')
+  }
   try {
     const startedAt = Date.now()
     fastify.log.info(`[ODOO_POST] ${path} iniciando`)
     const res = await axios.post(
       `${process.env.ODOO_URL}${path}`,
       { jsonrpc: '2.0', method: 'call', params },
-      { headers: { Cookie: odooSession.join('; ') }, timeout: 30000 }
+      {
+        headers: { 'X-Nexus-Admin-Token': process.env.NEXUS_ADMIN_TOKEN },
+        timeout: 30000,
+      }
     )
     fastify.log.info(`[ODOO_POST] ${path} OK ${Date.now() - startedAt}ms`)
     if (res.data.error) {
@@ -93,10 +59,13 @@ async function odooPost(path, params = {}) {
     }
     return res.data.result
   } catch (err) {
-    odooSession = null
     fastify.log.error(`[ODOO_POST] ${path} ERROR: ${err.stack || err.message}`)
     throw err
   }
+}
+
+async function odooCall() {
+  throw new Error('odooCall legacy deshabilitado; usar endpoints NEXUS con X-Nexus-Admin-Token')
 }
 
 // ─────────────────────────────────────────
@@ -514,6 +483,144 @@ fastify.post('/api/v1/auth/refresh', async (request, reply) => {
   }
 })
 
+function isAdminTokenValid(request) {
+  const expected = process.env.NEXUS_ADMIN_TOKEN || ''
+  const provided = request.headers['x-nexus-admin-token'] || ''
+  return Boolean(expected && provided && crypto.timingSafeEqual(
+    Buffer.from(String(provided)),
+    Buffer.from(String(expected))
+  ))
+}
+
+async function verifyAdminToken(request, reply) {
+  try {
+    if (!isAdminTokenValid(request)) {
+      return reply.code(401).send({ error: 'Token admin inválido' })
+    }
+  } catch {
+    return reply.code(401).send({ error: 'Token admin inválido' })
+  }
+}
+
+const syncLocks = new Map()
+
+async function runGatewaySync(name) {
+  if (syncLocks.has(name)) return syncLocks.get(name)
+
+  const promise = (async () => {
+    switch (name) {
+      case 'vendors':
+        return syncVendors(odooPost)
+      case 'clients':
+        return syncClients(odooPost)
+      case 'stock-delta':
+        return syncStock(odooPost, { mode: 'delta' })
+      case 'stock-full':
+        return syncStock(odooPost, { mode: 'full' })
+      case 'journals':
+        return syncPaymentJournals(odooPost)
+      case 'prices':
+        return runPriceBookSyncCycle({ processAll: true })
+      case 'outbox':
+        return {
+          requeued: await requeueOutboxBacklog(),
+          processed: await drainOutboxBacklog(20),
+        }
+      case 'all': {
+        const results = {}
+        for (const item of ['vendors', 'clients', 'journals', 'prices', 'stock-delta', 'outbox']) {
+          results[item] = await runGatewaySync(item)
+        }
+        return results
+      }
+      default:
+        throw new Error(`Sync desconocido: ${name}`)
+    }
+  })()
+
+  syncLocks.set(name, promise)
+  try {
+    return await promise
+  } finally {
+    syncLocks.delete(name)
+  }
+}
+
+fastify.get('/admin/sync', async (_, reply) => {
+  reply.type('text/html')
+  return `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEXUS Gateway Sync</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 32px; color: #172033; background: #f7f8fb; }
+    main { max-width: 840px; margin: auto; background: white; border-radius: 16px; padding: 24px; box-shadow: 0 12px 40px #1b25401a; }
+    h1 { margin-top: 0; }
+    label { display: block; margin-bottom: 12px; font-weight: 700; }
+    input { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #c8cfda; border-radius: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
+    button { padding: 12px 14px; border: 0; border-radius: 10px; background: #1646d8; color: white; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #2f3b52; }
+    button.danger { background: #9b2c2c; }
+    pre { min-height: 180px; overflow: auto; padding: 16px; border-radius: 10px; background: #101828; color: #d1e7ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>NEXUS Gateway Sync</h1>
+    <p>Ejecuta sincronizadores manuales sin reiniciar el gateway ni golpear Odoo durante deploy.</p>
+    <label>Admin token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="NEXUS_ADMIN_TOKEN">
+    <div class="grid">
+      <button data-sync="vendors">Vendedores</button>
+      <button data-sync="clients">Clientes</button>
+      <button data-sync="journals">Diarios</button>
+      <button data-sync="prices">Precios</button>
+      <button data-sync="stock-delta">Stock delta</button>
+      <button class="secondary" data-sync="stock-full">Stock full</button>
+      <button data-sync="outbox">Outbox</button>
+      <button class="danger" data-sync="all">Todo</button>
+    </div>
+    <pre id="output">Listo.</pre>
+  </main>
+  <script>
+    const output = document.getElementById('output')
+    document.querySelectorAll('button[data-sync]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const sync = button.dataset.sync
+        const token = document.getElementById('token').value
+        output.textContent = 'Ejecutando ' + sync + '...'
+        try {
+          const res = await fetch('/api/v1/admin/sync/' + sync, {
+            method: 'POST',
+            headers: { 'X-Nexus-Admin-Token': token },
+          })
+          const data = await res.json()
+          output.textContent = JSON.stringify(data, null, 2)
+        } catch (err) {
+          output.textContent = err.stack || err.message
+        }
+      })
+    })
+  </script>
+</body>
+</html>`
+})
+
+fastify.post('/api/v1/admin/sync/:name', { preHandler: [verifyAdminToken] }, async (request, reply) => {
+  const name = String(request.params.name || '')
+  const startedAt = Date.now()
+  try {
+    const result = await runGatewaySync(name)
+    return { status: 'ok', sync: name, duration_ms: Date.now() - startedAt, result }
+  } catch (err) {
+    fastify.log.error(`[ADMIN_SYNC] ${name}: ${err.stack || err.message}`)
+    return reply.code(500).send({ status: 'error', sync: name, error: err.message })
+  }
+})
+
 // ── CATALOG ───────────────────────────────
 
 fastify.get('/api/v1/catalog', async () => {
@@ -524,15 +631,9 @@ fastify.get('/api/v1/catalog', async () => {
 // ── PRODUCT IMAGE ─────────────────────────
 
 fastify.get('/api/v1/product/:id/image', async (request, reply) => {
-  if (!odooSession) await odooAuth()
   const url = `${process.env.ODOO_URL}/web/image/product.product/${request.params.id}/image_256`
   try {
-    let res = await axios.get(url, { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' })
-    if (res.status === 403 || res.status === 302) {
-      odooSession = null
-      await odooAuth()
-      res = await axios.get(url, { headers: { Cookie: odooSession.join('; ') }, responseType: 'arraybuffer' })
-    }
+    const res = await axios.get(url, { responseType: 'arraybuffer' })
     reply.header('Content-Type', res.headers['content-type'] || 'image/png')
     reply.header('Cache-Control', 'public, max-age=86400')
     return reply.send(Buffer.from(res.data))
@@ -1827,6 +1928,8 @@ fastify.post('/api/v1/photos/upload', { preHandler: [verifyToken] }, async (requ
 // Start
 // ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000
+const AUTO_SYNC_ON_START = process.env.NEXUS_AUTO_SYNC_ON_START === 'true'
+const ENABLE_SYNC_CRONS = process.env.NEXUS_ENABLE_SYNC_CRONS !== 'false'
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
   if (err) {
@@ -1850,12 +1953,14 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     fastify.log.info('[OUTBOX_DRAIN] BullMQ worker deshabilitado — procesando desde PostgreSQL')
   }
 
-  // Health check del módulo nexus_mobile — warning si no está instalado
-  try {
-    const h = await odooPost('/nexus/api/v1/health')
-    fastify.log.info(`[NEXUS MODULE] ✅ ${h.module} v${h.version} — ${h.vendor_count} vendedor(es) activo(s)`)
-  } catch (e) {
-    fastify.log.warn(`[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — sync de vendedores pausado hasta instalación`)
+  fastify.log.info(`[NEXUS SYNC] auto_start=${AUTO_SYNC_ON_START} crons=${ENABLE_SYNC_CRONS}`)
+  if (AUTO_SYNC_ON_START) {
+    try {
+      const h = await odooPost('/nexus/api/v1/health')
+      fastify.log.info(`[NEXUS MODULE] ✅ ${h.module} v${h.version} — ${h.vendor_count} vendedor(es) activo(s)`)
+    } catch (e) {
+      fastify.log.warn(`[NEXUS MODULE] ⚠️  Módulo no responde: ${e.message} — sync de vendedores pausado hasta instalación`)
+    }
   }
 
   // ── Cron: sync vendedores desde Odoo (cada 1 hora) ──
@@ -1870,9 +1975,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  // Correr al arrancar y luego cada hora
-  runVendorSync()
-  setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
+  if (AUTO_SYNC_ON_START) runVendorSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runVendorSync, VENDOR_SYNC_INTERVAL)
 
   // ── Cron: sync de price books desde Odoo (cada 2 minutos) ──
   const PRICE_SYNC_INTERVAL = 2 * 60 * 1000
@@ -1888,8 +1992,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  runPriceSync()
-  setInterval(runPriceSync, PRICE_SYNC_INTERVAL)
+  if (AUTO_SYNC_ON_START) runPriceSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runPriceSync, PRICE_SYNC_INTERVAL)
 
   // ── Cron: reconciliar outbox PENDING / SENDING zombies (cada 1 minuto) ──
   const OUTBOX_REQUEUE_INTERVAL = 60 * 1000
@@ -1905,8 +2009,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  runOutboxRequeue()
-  setInterval(runOutboxRequeue, OUTBOX_REQUEUE_INTERVAL)
+  if (AUTO_SYNC_ON_START) runOutboxRequeue()
+  if (ENABLE_SYNC_CRONS) setInterval(runOutboxRequeue, OUTBOX_REQUEUE_INTERVAL)
 
   // ── Cron: sync clientes desde Odoo (cada 6 horas) ────
   const CLIENT_SYNC_INTERVAL = 6 * 60 * 60 * 1000
@@ -1920,9 +2024,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  // Correr al arrancar y luego cada 6 horas
-  runClientSync()
-  setInterval(runClientSync, CLIENT_SYNC_INTERVAL)
+  if (AUTO_SYNC_ON_START) runClientSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runClientSync, CLIENT_SYNC_INTERVAL)
 
   // ── Cron: sync stock desde Odoo ────────────────────────────
   // Dos cadencias:
@@ -1951,11 +2054,12 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  // Al arrancar: full sync (cubre cualquier gap durante el downtime).
-  // Después: delta cada 20min y full cada 6h independientes.
-  runStockFull()
-  setInterval(runStockDelta, STOCK_DELTA_INTERVAL)
-  setInterval(runStockFull, STOCK_FULL_INTERVAL)
+  // Si AUTO_SYNC_ON_START=false, el full inicial se ejecuta manualmente desde /admin/sync.
+  if (AUTO_SYNC_ON_START) runStockFull()
+  if (ENABLE_SYNC_CRONS) {
+    setInterval(runStockDelta, STOCK_DELTA_INTERVAL)
+    setInterval(runStockFull, STOCK_FULL_INTERVAL)
+  }
 
   // ── Cron: sync diarios de pago desde Odoo (cada 6 horas) ─────
   const JOURNALS_SYNC_INTERVAL = 6 * 60 * 60 * 1000
@@ -1969,8 +2073,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  runJournalsSync()
-  setInterval(runJournalsSync, JOURNALS_SYNC_INTERVAL)
+  if (AUTO_SYNC_ON_START) runJournalsSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runJournalsSync, JOURNALS_SYNC_INTERVAL)
 
   // ── Cron: expirar reservas pending viejas ─────────────────────
   // Si el worker crashea entre crear la reserva y procesarla en Odoo, la
@@ -1987,5 +2091,5 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     }
   }
 
-  setInterval(runReservationExpiration, RESERVATION_EXPIRE_INTERVAL)
+  if (ENABLE_SYNC_CRONS) setInterval(runReservationExpiration, RESERVATION_EXPIRE_INTERVAL)
 })
