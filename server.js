@@ -12,7 +12,9 @@ const { worker, setOdooCall, setOdooPost } = require('./queues/worker')
 const { processOrder } = require('./queues/processors/order')
 const { processVisit } = require('./queues/processors/visit')
 const { syncVendors } = require('./crons/sync_vendors')
-const { syncClients, syncVendorClients } = require('./crons/sync_clients')
+const { syncClients } = require('./crons/sync_clients')
+const { syncVendorCompanies } = require('./crons/sync_vendor_companies')
+const { syncVendorOrders } = require('./crons/sync_vendor_orders')
 const { syncStock } = require('./crons/sync_stock')
 const { syncProductImages } = require('./crons/sync_product_images')
 const { syncPaymentJournals } = require('./crons/sync_payment_journals')
@@ -517,6 +519,10 @@ async function runGatewaySync(name, options = {}) {
         return syncVendors(odooPost)
       case 'clients':
         return syncClients(odooPost)
+      case 'companies':
+        return syncVendorCompanies(odooPost)
+      case 'orders':
+        return syncVendorOrders(odooPost, options)
       case 'stock-delta':
         return syncStock(odooPost, { mode: 'delta' })
       case 'stock-full':
@@ -534,7 +540,7 @@ async function runGatewaySync(name, options = {}) {
         }
       case 'all': {
         const results = {}
-        for (const item of ['vendors', 'clients', 'journals', 'prices', 'product-images', 'stock-delta', 'outbox']) {
+        for (const item of ['vendors', 'clients', 'companies', 'orders', 'journals', 'prices', 'product-images', 'stock-delta', 'outbox']) {
           results[item] = await runGatewaySync(item, options)
         }
         return results
@@ -591,6 +597,8 @@ fastify.get('/admin/sync', async (_, reply) => {
     <div class="grid">
       <button data-sync="vendors">Vendedores</button>
       <button data-sync="clients">Clientes</button>
+      <button data-sync="companies">Empresas</button>
+      <button data-sync="orders">Pedidos</button>
       <button data-sync="journals">Diarios</button>
       <button data-sync="prices">Precios</button>
       <button data-sync="product-images">Imágenes faltantes</button>
@@ -732,22 +740,12 @@ fastify.get('/api/v1/prices/book', { preHandler: [verifyToken] }, async (request
 
 fastify.post('/api/v1/prices/sync', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id, uuid } = request.user
-
-  const clientSync = await syncVendorClients(odooPost, {
-    vendedorId: vendedor_id,
-    nexusUuid: uuid,
-  })
-  if (clientSync.errores) {
-    return reply.code(502).send({ error: 'No se pudo sincronizar clientes desde Odoo' })
-  }
-
-  const cycle = await runPriceBookSyncCycle({ processAll: true })
   const book = await getVendorPriceBook(vendedor_id)
 
   return {
     status: 'ok',
-    client_sync: clientSync,
-    sync_cycle: cycle,
+    source: 'gateway_cache',
+    vendor_uuid: uuid,
     ...book,
   }
 })
@@ -761,24 +759,44 @@ fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, rep
   const state = request.query.state || null
   const search = request.query.search || null
 
-  const result = await odooPost('/nexus/api/v1/vendor_orders', {
-    vendor_nexus_uuid: uuid,
-    limit,
-    offset,
-    state,
-    search,
-  })
-  if (!result) return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
+  const conditions = ['vendor_uuid = $1']
+  const params = [uuid]
+  if (state) {
+    params.push(state)
+    conditions.push(`state = $${params.length}`)
+  }
+  if (search) {
+    params.push(`%${search}%`)
+    conditions.push(`(
+      order_name ILIKE $${params.length}
+      OR partner_name ILIKE $${params.length}
+      OR partner_vat ILIKE $${params.length}
+      OR client_order_ref ILIKE $${params.length}
+    )`)
+  }
 
-  await reconcileOrdersFromOdooOrders(result.orders || [])
+  const where = conditions.join(' AND ')
+  const totalResult = await query(
+    `SELECT COUNT(*)::int AS total FROM vendor_orders_cache WHERE ${where}`,
+    params
+  )
+  const rowsResult = await query(
+    `SELECT payload
+       FROM vendor_orders_cache
+      WHERE ${where}
+      ORDER BY date_order DESC NULLS LAST, order_id DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, limit, offset]
+  )
+  const orders = rowsResult.rows.map((row) => row.payload)
 
   return {
     status: 'ok',
-    orders: result.orders || [],
-    count: result.count || 0,
-    total: result.total || 0,
-    limit: result.limit || limit,
-    offset: result.offset || offset,
+    orders,
+    count: orders.length,
+    total: totalResult.rows[0]?.total || 0,
+    limit,
+    offset,
   }
 })
 
@@ -787,16 +805,27 @@ fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, rep
 fastify.get('/api/v1/vendor/companies', { preHandler: [verifyToken] }, async (request, reply) => {
   const { uuid } = request.user  // nexus_uuid del vendedor
 
-  const result = await odooPost('/nexus/api/v1/vendor_companies', { nexus_uuid: uuid })
-  if (!result) {
-    return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
-  }
+  const result = await query(
+    `SELECT company_id, company_name, currency_code, warehouse_id, warehouse_name, is_default
+       FROM vendor_companies
+      WHERE vendor_uuid = $1
+      ORDER BY company_name`,
+    [uuid]
+  )
+  const companies = result.rows.map((row) => ({
+    id: row.company_id,
+    name: row.company_name,
+    currency: row.currency_code,
+    warehouse_id: row.warehouse_id,
+    warehouse_name: row.warehouse_name,
+  }))
+  const defaultCompany = result.rows.find((row) => row.is_default) || result.rows[0]
 
   return {
     status:             'ok',
-    count:              result.count              ?? 0,
-    default_company_id: result.default_company_id ?? null,
-    companies:          result.companies          ?? []
+    count:              companies.length,
+    default_company_id: defaultCompany?.company_id ?? null,
+    companies,
   }
 })
 
@@ -824,7 +853,7 @@ fastify.get('/api/v1/vendor/stock', { preHandler: [verifyToken] }, async (reques
     })
   }
 
-  await reconcileActiveReservationsForVendorWarehouse(vendorNexusUuid, vendorId, warehouseId)
+  // No consultar Odoo durante refresh de app; la reconciliación ocurre en cron/manual sync_stock.
 
   let sql = `
     SELECT
@@ -1058,16 +1087,6 @@ fastify.get('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (re
 fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id, uuid } = request.user
 
-  const syncResult = await syncVendorClients(odooPost, {
-    vendedorId: vendedor_id,
-    nexusUuid: uuid,
-  })
-  if (syncResult.errores) {
-    return reply.code(502).send({ error: 'No se pudo conectar con Odoo' })
-  }
-
-  await runPriceBookSyncCycle({ processAll: true })
-
   // Devolver la lista actualizada desde PostgreSQL
   const updated = await query(
     `SELECT c.odoo_id, c.nombre, c.rif, c.telefono, c.direccion,
@@ -1100,9 +1119,10 @@ fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (reque
   fastify.log.info(`[SYNC_CLIENTS_MANUAL] vendedor_id=${vendedor_id} clientes=${clientes.length}`)
   return {
     status: 'ok',
+    source: 'gateway_cache',
     count: clientes.length,
     clientes,
-    pricelist_assignments: syncResult.pricelist_assignments || 0,
+    vendor_uuid: uuid,
   }
 })
 
@@ -1633,21 +1653,21 @@ fastify.get('/api/v1/sync/status', { preHandler: [verifyToken] }, async (request
 
     if (event.tipo === 'ORDER_CREATED' && event.estado === 'DONE') {
       try {
-        const orderResult = await odooPost('/nexus/api/v1/vendor_orders', {
-          vendor_nexus_uuid: vendorNexusUuid,
-          limit: 1,
-          offset: 0,
-          search: event.client_uuid,
-        })
-        const order = (orderResult?.orders || []).find((item) => item.client_order_ref === event.client_uuid)
+        const cachedOrder = await query(
+          `SELECT payload
+             FROM vendor_orders_cache
+            WHERE vendor_uuid = $1 AND client_order_ref = $2
+            LIMIT 1`,
+          [vendorNexusUuid, event.client_uuid]
+        )
+        const order = cachedOrder.rows[0]?.payload
         if (order) {
           event.estado = order.state || event.estado
           event.odoo_ref = order.name || event.odoo_ref
           event.odoo_order_id = order.id || null
-          await reconcileOrdersFromOdooOrders([order])
         }
       } catch (err) {
-        fastify.log.error(`[SYNC_STATUS] ${event.client_uuid}: no se pudo leer estado Odoo: ${err.message}`)
+        fastify.log.error(`[SYNC_STATUS] ${event.client_uuid}: no se pudo leer cache de pedido: ${err.message}`)
       }
     }
 
@@ -2048,6 +2068,8 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
     try {
       const result = await syncClients(odooPost)
       fastify.log.info(`[SYNC_CLIENTS] clientes: ${result.clientes}, relaciones: ${result.relaciones}`)
+      const companies = await syncVendorCompanies(odooPost)
+      fastify.log.info(`[SYNC_VENDOR_COMPANIES] vendors=${companies.vendors || 0} companies=${companies.companies || 0}`)
     } catch (e) {
       fastify.log.error(`[SYNC_CLIENTS] Error: ${e.message}`)
     }
@@ -2104,6 +2126,21 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {
 
   if (AUTO_SYNC_ON_START) runJournalsSync()
   if (ENABLE_SYNC_CRONS) setInterval(runJournalsSync, JOURNALS_SYNC_INTERVAL)
+
+  // ── Cron: cache de pedidos por vendedor (cada 30 minutos) ─────
+  const ORDERS_SYNC_INTERVAL = 30 * 60 * 1000
+
+  async function runOrdersSync() {
+    try {
+      const result = await syncVendorOrders(odooPost)
+      fastify.log.info(`[SYNC_VENDOR_ORDERS] synced=${result.synced || 0} vendors=${result.vendors || 0}`)
+    } catch (e) {
+      fastify.log.error(`[SYNC_VENDOR_ORDERS] Error: ${e.message}`)
+    }
+  }
+
+  if (AUTO_SYNC_ON_START) runOrdersSync()
+  if (ENABLE_SYNC_CRONS) setInterval(runOrdersSync, ORDERS_SYNC_INTERVAL)
 
   // ── Cron: cache local de imágenes de productos (cada 12 horas) ─────
   const PRODUCT_IMAGES_SYNC_INTERVAL = 12 * 60 * 60 * 1000
