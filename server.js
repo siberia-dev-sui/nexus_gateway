@@ -752,12 +752,76 @@ fastify.post('/api/v1/prices/sync', { preHandler: [verifyToken] }, async (reques
 
 // ── PEDIDOS DEL VENDEDOR ──────────────────────────────────────────────────────
 
+async function upsertVendorOrderCache(vendorUuid, order) {
+  await query(
+    `INSERT INTO vendor_orders_cache (
+       vendor_uuid, order_id, order_name, state, partner_id, partner_name,
+       partner_vat, date_order, write_date, amount_total, currency_code,
+       client_order_ref, payload, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+     ON CONFLICT (vendor_uuid, order_id) DO UPDATE SET
+       order_name       = EXCLUDED.order_name,
+       state            = EXCLUDED.state,
+       partner_id       = EXCLUDED.partner_id,
+       partner_name     = EXCLUDED.partner_name,
+       partner_vat      = EXCLUDED.partner_vat,
+       date_order       = EXCLUDED.date_order,
+       write_date       = EXCLUDED.write_date,
+       amount_total     = EXCLUDED.amount_total,
+       currency_code    = EXCLUDED.currency_code,
+       client_order_ref = EXCLUDED.client_order_ref,
+       payload          = EXCLUDED.payload,
+       updated_at       = NOW()`,
+    [
+      vendorUuid,
+      order.id,
+      order.name || null,
+      order.state || null,
+      order.partner_id || null,
+      order.partner_name || null,
+      order.partner_vat || null,
+      order.date_order || null,
+      order.write_date || null,
+      order.amount_total || 0,
+      order.currency || null,
+      order.client_order_ref || null,
+      JSON.stringify(order),
+    ]
+  )
+}
+
 fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, reply) => {
   const { uuid } = request.user
   const limit = Math.min(Math.max(Number(request.query.limit || 30), 1), 100)
   const offset = Math.max(Number(request.query.offset || 0), 0)
   const state = request.query.state || null
   const search = request.query.search || null
+
+  try {
+    const result = await odooPost('/nexus/api/v1/vendor_orders', {
+      vendor_nexus_uuid: uuid,
+      limit,
+      offset,
+      state,
+      search,
+    })
+    const liveOrders = result?.orders || []
+    for (const order of liveOrders) {
+      await upsertVendorOrderCache(uuid, order)
+    }
+    await reconcileOrdersFromOdooOrders(liveOrders)
+    return {
+      status: 'ok',
+      source: 'odoo_live',
+      orders: liveOrders,
+      count: result?.count || liveOrders.length,
+      total: result?.total || 0,
+      limit: result?.limit || limit,
+      offset: result?.offset || offset,
+    }
+  } catch (err) {
+    fastify.log.warn(`[GET /orders] Odoo no disponible, usando cache local: ${err.message}`)
+  }
 
   const conditions = ['vendor_uuid = $1']
   const params = [uuid]
@@ -792,6 +856,7 @@ fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, rep
 
   return {
     status: 'ok',
+    source: 'gateway_cache',
     orders,
     count: orders.length,
     total: totalResult.rows[0]?.total || 0,
