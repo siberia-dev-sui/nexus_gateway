@@ -1438,7 +1438,12 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       const existingRow = existing.rows[0]
 
       // Si ya está procesado (DONE) — devolver el resultado, no re-ejecutar.
-      if (existingRow.estado === 'DONE') {
+      // PERO solo si el DONE corresponde al MISMO tipo que el evento entrante.
+      // El _checkinUuid se reutiliza para VISIT_CHECKIN (local, odoo_ref='local')
+      // y luego para VISIT_COMPLETED (real, debe ir a Odoo). Si el row dice
+      // DONE pero por un VISIT_CHECKIN previo, el COMPLETED entrante TIENE que
+      // procesarse normalmente — caer a la lógica de claim de abajo.
+      if (existingRow.estado === 'DONE' && existingRow.tipo === tipo) {
         if (tipo === 'ORDER_CREATED') {
           const ped = await query(
             'SELECT odoo_order_id, odoo_order_name FROM pedidos WHERE client_uuid = $1',
@@ -1455,8 +1460,13 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           continue
         }
         if (tipo === 'VISIT_COMPLETED') {
-          results.push({ client_uuid, status: 'DONE', odoo_ref: existingRow.odoo_ref, skipped: true })
-          continue
+          // Solo skip si ya hay un odoo_ref real (no el placeholder 'local'
+          // que dejó un VISIT_CHECKIN previo con el mismo UUID).
+          if (existingRow.odoo_ref && existingRow.odoo_ref !== 'local') {
+            results.push({ client_uuid, status: 'DONE', odoo_ref: existingRow.odoo_ref, skipped: true })
+            continue
+          }
+          // odoo_ref es 'local' o vacío → cae al handler de VISIT_COMPLETED abajo.
         }
       }
 
