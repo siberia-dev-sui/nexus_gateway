@@ -134,13 +134,31 @@ function catalogCacheKey(productIds = null) {
 async function reconcileOrdersFromOdooOrders(orders) {
   if (!Array.isArray(orders) || !orders.length) return
 
+  let stockChanged = false
   for (const order of orders) {
     const uuid = order?.client_order_ref
     try {
-      await applyOdooOrderStateToReservations(order, { logger: fastify.log })
+      const r = await applyOdooOrderStateToReservations(order, { logger: fastify.log })
+      // Si liberamos o marcamos reservas (cancel/sale/done), el stock visible
+      // del producto cambió. Marcamos para disparar un stock-delta abajo:
+      // así la app NO tiene que esperar al próximo cron para ver el inventario
+      // ajustado contra Odoo. (Para cancel, Odoo no movió on-hand pero igual
+      // refrescamos por si venía de un sale revertido con pickings.)
+      if (r.released > 0 || r.marked > 0) {
+        stockChanged = true
+      }
     } catch (err) {
       fastify.log.error(`[RESERVATIONS] ${uuid || '?'}: error reconciliando contra Odoo: ${err.message}`)
     }
+  }
+
+  // Fire-and-forget: NO await. La respuesta al cliente sale ya; el delta se
+  // procesa en background y la siguiente request del cliente verá el stock
+  // actualizado. El lock interno de runGatewaySync impide solapamientos.
+  if (stockChanged) {
+    runGatewaySync('stock-delta')
+      .then((res) => fastify.log.info(`[RESERVATIONS] stock-delta auto-disparado tras reconcile: ${JSON.stringify(res)}`))
+      .catch((err) => fastify.log.warn(`[RESERVATIONS] stock-delta auto-disparado falló: ${err.message}`))
   }
 }
 
