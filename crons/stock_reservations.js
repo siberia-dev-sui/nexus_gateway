@@ -464,13 +464,38 @@ async function applyOdooOrderStateToReservations(order, { logger = console } = {
     }
   } else if (state === 'cancel') {
     released = await releaseActiveReservations(uuid, 'odoo_cancelled')
-    if (released > 0 && logger?.info) {
-      logger.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s) por cancelación Odoo`)
+    if (logger?.info) {
+      logger.info(`[RESERVATIONS] ${uuid}: state=cancel → ${released} reserva(s) liberada(s)`)
     }
   } else if (state === 'draft' || state === 'sent') {
     adjusted = await reconcileConfirmedReservations(uuid, order.lines)
     if (adjusted > 0 && logger?.info) {
       logger.info(`[RESERVATIONS] ${uuid}: ${adjusted} línea(s) ajustada(s) contra borrador Odoo`)
+    }
+  }
+
+  // Reflejar el estado de Odoo en la tabla pedidos del gateway.
+  // Antes solo se escribía 'confirmado' al crearse el pedido en Odoo y luego
+  // nadie lo actualizaba — al cancelarse, la BD del gateway seguía mostrando
+  // 'confirmado'. Esto NO afecta reservas (esas se manejan arriba), solo
+  // mantiene el reflejo de estado consistente para reportes y la app.
+  let estadoPedido = null
+  if (state === 'sale' || state === 'done') estadoPedido = 'confirmado'
+  else if (state === 'cancel') estadoPedido = 'cancelado'
+  else if (state === 'draft' || state === 'sent') estadoPedido = 'pendiente'
+
+  if (estadoPedido) {
+    try {
+      await query(
+        `UPDATE pedidos
+            SET estado = $1, updated_at = NOW()
+          WHERE client_uuid = $2 AND estado <> $1`,
+        [estadoPedido, uuid]
+      )
+    } catch (err) {
+      if (logger?.warn) {
+        logger.warn(`[RESERVATIONS] ${uuid}: no se pudo actualizar pedidos.estado=${estadoPedido}: ${err.message}`)
+      }
     }
   }
 
