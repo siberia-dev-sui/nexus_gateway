@@ -1,6 +1,6 @@
 const { query, redis } = require('../db')
 const {
-  releaseActiveReservations,
+  applyOdooOrderStateToReservations,
   releaseDeductedReservationsCoveredByStockSync,
 } = require('./stock_reservations')
 
@@ -78,27 +78,36 @@ async function reconcileActiveReservationsFromOdoo(odooPost, items, tag) {
     [productIds, warehouseIds]
   )
 
-  let released = 0
+  // Agrupar reservas por vendor_nexus_uuid → 1 llamada batch a Odoo por
+  // vendedor (vs 1 llamada por reserva, que saturaba el worker HTTP).
+  const byVendor = new Map()
   for (const row of active.rows) {
-    const orderUuid = String(row.order_uuid)
+    const vUuid = String(row.vendor_nexus_uuid)
+    if (!byVendor.has(vUuid)) byVendor.set(vUuid, [])
+    byVendor.get(vUuid).push(String(row.order_uuid))
+  }
+
+  let released = 0
+  for (const [vendorNexusUuid, refs] of byVendor.entries()) {
     try {
       const result = await odooPost('/nexus/api/v1/vendor_orders', {
-        vendor_nexus_uuid: row.vendor_nexus_uuid,
-        limit: 1,
-        offset: 0,
-        search: orderUuid,
+        vendor_nexus_uuid: vendorNexusUuid,
+        client_order_refs: refs,
       })
-      const order = (result?.orders || []).find((item) => item.client_order_ref === orderUuid)
-      if (!order) continue
-
-      if (order.state === 'sale' || order.state === 'done' || order.state === 'cancel') {
-        released += await releaseActiveReservations(
-          orderUuid,
-          order.state === 'cancel' ? 'odoo_cancelled_stock_sync' : 'odoo_confirmed_stock_sync'
-        )
+      const orders = result?.orders || []
+      // Aplicar el helper unificado: misma lógica que server.js, así sync_stock
+      // y el refresh de "Mis pedidos" jamás dejan las reservas en estados
+      // divergentes. El helper se encarga de mark vs release con timestamp.
+      for (const order of orders) {
+        try {
+          const r = await applyOdooOrderStateToReservations(order)
+          released += r.released
+        } catch (err) {
+          console.error(`${tag} ${order?.client_order_ref}: ${err.message}`)
+        }
       }
     } catch (err) {
-      console.error(`${tag} No se pudo reconciliar reserva ${orderUuid}:`, err.message)
+      console.error(`${tag} batch reconcile vendor=${vendorNexusUuid} (${refs.length} refs): ${err.message}`)
     }
   }
 

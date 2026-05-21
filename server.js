@@ -21,8 +21,8 @@ const { syncPaymentJournals } = require('./crons/sync_payment_journals')
 const {
   validateAndReserve,
   failReservations,
-  reconcileConfirmedReservations,
   releaseActiveReservations,
+  applyOdooOrderStateToReservations,
   expireOldReservations,
 } = require('./crons/stock_reservations')
 const { generateRoutes } = require('./crons/generate_routes')
@@ -136,30 +136,10 @@ async function reconcileOrdersFromOdooOrders(orders) {
 
   for (const order of orders) {
     const uuid = order?.client_order_ref
-    const state = order?.state
-    if (!uuid || !Array.isArray(order.lines)) continue
-
     try {
-      if (state === 'sale' || state === 'done') {
-        await confirmReservations(uuid, order.lines)
-        await reconcileConfirmedReservations(uuid, order.lines)
-        const released = await releaseActiveReservations(uuid, 'odoo_confirmed')
-        if (released > 0) {
-          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); Odoo confirmado`)
-        }
-      } else if (state === 'draft' || state === 'sent') {
-        const adjusted = await reconcileConfirmedReservations(uuid, order.lines)
-        if (adjusted > 0) {
-          fastify.log.info(`[RESERVATIONS] ${uuid}: ${adjusted} línea(s) ajustada(s) contra borrador Odoo`)
-        }
-      } else if (state === 'cancel') {
-        const released = await releaseActiveReservations(uuid, 'odoo_cancelled')
-        if (released > 0) {
-          fastify.log.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s) por cancelación Odoo`)
-        }
-      }
+      await applyOdooOrderStateToReservations(order, { logger: fastify.log })
     } catch (err) {
-      fastify.log.error(`[RESERVATIONS] ${uuid}: error reconciliando contra Odoo: ${err.message}`)
+      fastify.log.error(`[RESERVATIONS] ${uuid || '?'}: error reconciliando contra Odoo: ${err.message}`)
     }
   }
 }
@@ -178,19 +158,17 @@ async function reconcileActiveReservationsForVendorWarehouse(vendorNexusUuid, ve
 
   if (!active.rows.length) return
 
-  for (const row of active.rows) {
-    const orderUuid = String(row.order_uuid)
-    try {
-      const result = await odooPost('/nexus/api/v1/vendor_orders', {
-        vendor_nexus_uuid: vendorNexusUuid,
-        limit: 1,
-        offset: 0,
-        search: orderUuid,
-      })
-      await reconcileOrdersFromOdooOrders(result?.orders || [])
-    } catch (err) {
-      fastify.log.error(`[RESERVATIONS] ${orderUuid}: no se pudo reconciliar antes de stock: ${err.message}`)
-    }
+  // Una sola llamada a Odoo con TODOS los UUIDs (vs N llamadas que era antes).
+  // Reduce drásticamente la carga del worker HTTP de Odoo.
+  const refs = active.rows.map((r) => String(r.order_uuid))
+  try {
+    const result = await odooPost('/nexus/api/v1/vendor_orders', {
+      vendor_nexus_uuid: vendorNexusUuid,
+      client_order_refs: refs,
+    })
+    await reconcileOrdersFromOdooOrders(result?.orders || [])
+  } catch (err) {
+    fastify.log.error(`[RESERVATIONS] vendor=${vendorNexusUuid} wh=${warehouseId}: batch reconcile falló (${refs.length} refs): ${err.message}`)
   }
 }
 
@@ -1448,13 +1426,46 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       continue
     }
 
-    // Idempotencia — si ya existe este UUID, no procesar de nuevo
+    // Idempotencia — leer estado actual; las transiciones se hacen vía CLAIM
+    // atómico (UPDATE ... WHERE estado IN (...) RETURNING) más abajo, que es
+    // seguro frente a concurrencia sin necesidad de mantener transacción
+    // abierta durante el HTTP a Odoo.
     const existing = await query(
       'SELECT estado, tipo, odoo_ref, updated_at FROM outbox WHERE client_uuid = $1',
       [client_uuid]
     )
     if (existing.rows.length) {
       const existingRow = existing.rows[0]
+
+      // Si ya está procesado (DONE) — devolver el resultado, no re-ejecutar.
+      if (existingRow.estado === 'DONE') {
+        if (tipo === 'ORDER_CREATED') {
+          const ped = await query(
+            'SELECT odoo_order_id, odoo_order_name FROM pedidos WHERE client_uuid = $1',
+            [client_uuid]
+          )
+          const pedRow = ped.rows[0] || {}
+          results.push({
+            client_uuid,
+            status: 'DONE',
+            odoo_order_id: pedRow.odoo_order_id || null,
+            odoo_order_name: pedRow.odoo_order_name || null,
+            skipped: true,
+          })
+          continue
+        }
+        if (tipo === 'VISIT_COMPLETED') {
+          results.push({ client_uuid, status: 'DONE', odoo_ref: existingRow.odoo_ref, skipped: true })
+          continue
+        }
+      }
+
+      // Si otro request del mismo client_uuid ya está procesando (SENDING),
+      // NO re-ejecutar — devolver PROCESSING para que el cliente reintente.
+      if (existingRow.estado === 'SENDING') {
+        results.push({ client_uuid, status: 'PROCESSING', skipped: true })
+        continue
+      }
 
       if (tipo === 'ORDER_CREATED' && existingRow.estado !== 'DONE') {
         // Validar stock y reservar antes de tocar el pedido — anti-overselling
@@ -1480,13 +1491,21 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         }
 
         try {
-          await query(
+          // CLAIM atómico: solo procesamos si el estado actual NO es SENDING/DONE.
+          // Si otro request ganó la carrera, el UPDATE devuelve 0 filas y salimos.
+          const claimed = await query(
             `UPDATE outbox
                SET tipo = 'ORDER_CREATED', estado = 'SENDING', payload = $1,
                    error_msg = NULL, updated_at = NOW()
-             WHERE client_uuid = $2`,
+             WHERE client_uuid = $2
+               AND estado NOT IN ('SENDING', 'DONE')
+             RETURNING client_uuid`,
             [JSON.stringify(payload), client_uuid]
           )
+          if (!claimed.rows.length) {
+            results.push({ client_uuid, status: 'PROCESSING', skipped: true })
+            continue
+          }
           await query(
             `INSERT INTO pedidos (client_uuid, vendedor_id, cliente_odoo_id, total, notas)
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT (client_uuid) DO NOTHING`,
@@ -1587,12 +1606,25 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
       }
     }
 
-    // Insertar en outbox
-    await query(
+    // Insertar en outbox. Si otro request del mismo client_uuid ganó la carrera,
+    // ON CONFLICT no inserta — devolvemos PROCESSING para que el cliente espere.
+    const inserted = await query(
       `INSERT INTO outbox (client_uuid, vendedor_id, tipo, estado, payload, device_id)
-       VALUES ($1, $2, $3, 'PENDING', $4, $5)`,
+       VALUES ($1, $2, $3, 'PENDING', $4, $5)
+       ON CONFLICT (client_uuid) DO NOTHING
+       RETURNING client_uuid`,
       [client_uuid, vendedor_id, tipo, JSON.stringify(payload), event.device_id || null]
     )
+    if (!inserted.rows.length) {
+      // Otro request ya lo insertó entre nuestro SELECT y este INSERT.
+      results.push({ client_uuid, status: 'PROCESSING', skipped: true })
+      // Liberar la reserva que creamos arriba (si era ORDER_CREATED), ya que
+      // el ganador de la carrera creará la suya propia o ya la creó.
+      if (tipo === 'ORDER_CREATED') {
+        await failReservations(client_uuid, 'duplicate_request_lost_race').catch(() => {})
+      }
+      continue
+    }
 
     // Insertar en tabla específica según tipo
     if (tipo === 'ORDER_CREATED') {
@@ -1621,10 +1653,16 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     if (tipo === 'ORDER_CREATED') {
       try {
-        await query(
-          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW() WHERE client_uuid = $1`,
+        const claimed = await query(
+          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW()
+            WHERE client_uuid = $1 AND estado NOT IN ('SENDING', 'DONE')
+            RETURNING client_uuid`,
           [client_uuid]
         )
+        if (!claimed.rows.length) {
+          results.push({ client_uuid, status: 'PROCESSING', skipped: true })
+          continue
+        }
         const result = await processOrder(
           { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
           odooPost
@@ -1649,10 +1687,16 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
 
     if (tipo === 'VISIT_COMPLETED') {
       try {
-        await query(
-          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW() WHERE client_uuid = $1`,
+        const claimed = await query(
+          `UPDATE outbox SET estado = 'SENDING', updated_at = NOW()
+            WHERE client_uuid = $1 AND estado NOT IN ('SENDING', 'DONE')
+            RETURNING client_uuid`,
           [client_uuid]
         )
+        if (!claimed.rows.length) {
+          results.push({ client_uuid, status: 'PROCESSING', skipped: true })
+          continue
+        }
         const result = await processVisit(
           { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
           odooPost
@@ -2042,7 +2086,11 @@ fastify.post('/api/v1/photos/upload', { preHandler: [verifyToken] }, async (requ
 // Start
 // ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000
-const AUTO_SYNC_ON_START = process.env.NEXUS_AUTO_SYNC_ON_START === 'true'
+// REGLA OPERATIVA (requisito #7): el gateway NUNCA debe sincronizar al
+// arrancar. Toda sincronización es manual (endpoints /admin/sync) o por
+// cron. Hard-deshabilitado para evitar que una variable de entorno olvidada
+// en `.env` dispare sincronizaciones masivas cada reinicio.
+const AUTO_SYNC_ON_START = false
 const ENABLE_SYNC_CRONS = process.env.NEXUS_ENABLE_SYNC_CRONS !== 'false'
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, async (err) => {

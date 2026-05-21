@@ -309,12 +309,21 @@ async function releaseDeductedReservationsCoveredByStockSync(items) {
   const warehouseIds = [...new Set(items.map((item) => parseInt(item.warehouse_id, 10)).filter(Boolean))]
   if (!productIds.length || !warehouseIds.length) return 0
 
+  // CRÍTICO: la liberación SOLO es segura cuando el stock_levels.updated_at
+  // que acabamos de sincronizar es POSTERIOR al resolved_at marcado en la
+  // reserva. Sin esa validación liberamos reservas contra stock_levels
+  // antiguos que aún no reflejan la confirmación en Odoo → sobreventa.
+  // (Bug introducido en commit cd98ce3 al remover el JOIN; aquí se restaura.)
   const result = await query(
     `UPDATE reservations r
         SET status = 'failed', resolved_at = NOW()
+       FROM stock_levels sl
       WHERE r.status = 'deducted_pending_sync'
         AND r.product_id = ANY($1::int[])
-        AND r.warehouse_id = ANY($2::int[])`,
+        AND r.warehouse_id = ANY($2::int[])
+        AND sl.product_id = r.product_id
+        AND sl.warehouse_id = r.warehouse_id
+        AND sl.updated_at >= r.resolved_at`,
     [productIds, warehouseIds]
   )
   return result.rowCount
@@ -409,6 +418,65 @@ async function expireOldReservations() {
   return result.rowCount
 }
 
+/**
+ * Aplica el estado de UN pedido de Odoo a sus reservas en el gateway.
+ * Fuente única de verdad para todo el ciclo: server.js (cuando la app refresca
+ * "Mis pedidos") y crons/sync_stock.js (red de seguridad por cron) deben
+ * llamar a esta función — así jamás divergen.
+ *
+ * Reglas:
+ *   - state === 'sale' / 'done': confirmar líneas; luego, si el stock_levels
+ *     YA refleja la confirmación (write_date <= sl.updated_at), liberar.
+ *     Si NO, marcar deducted_pending_sync y esperar al próximo stock_sync.
+ *     Esto evita la ventana de sobreventa que introdujo el commit ac1a611.
+ *   - state === 'cancel': liberar inmediatamente.
+ *   - state === 'draft' / 'sent': solo ajustar cantidades confirmadas.
+ *
+ * Retorna { released, marked, adjusted } para logging.
+ */
+async function applyOdooOrderStateToReservations(order, { logger = console } = {}) {
+  const uuid = order?.client_order_ref
+  const state = order?.state
+  if (!uuid || !Array.isArray(order.lines)) {
+    return { released: 0, marked: 0, adjusted: 0 }
+  }
+
+  let released = 0
+  let marked = 0
+  let adjusted = 0
+
+  if (state === 'sale' || state === 'done') {
+    await confirmReservations(uuid, order.lines)
+    await reconcileConfirmedReservations(uuid, order.lines)
+
+    const syncedAfter = order.write_date || order.date_order || new Date().toISOString()
+    const stockAlreadyCovered = await activeReservationsCoveredByStockSync(uuid, syncedAfter)
+    if (stockAlreadyCovered) {
+      released = await releaseActiveReservations(uuid, 'odoo_confirmed_stock_synced')
+      if (released > 0 && logger?.info) {
+        logger.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s); Odoo confirmado y stock ya sincronizado`)
+      }
+    } else {
+      marked = await markReservationsAwaitingStockSync(uuid, syncedAfter)
+      if (marked > 0 && logger?.info) {
+        logger.info(`[RESERVATIONS] ${uuid}: ${marked} reserva(s) en deducted_pending_sync; esperando stock_sync posterior a ${syncedAfter}`)
+      }
+    }
+  } else if (state === 'cancel') {
+    released = await releaseActiveReservations(uuid, 'odoo_cancelled')
+    if (released > 0 && logger?.info) {
+      logger.info(`[RESERVATIONS] ${uuid}: ${released} reserva(s) liberada(s) por cancelación Odoo`)
+    }
+  } else if (state === 'draft' || state === 'sent') {
+    adjusted = await reconcileConfirmedReservations(uuid, order.lines)
+    if (adjusted > 0 && logger?.info) {
+      logger.info(`[RESERVATIONS] ${uuid}: ${adjusted} línea(s) ajustada(s) contra borrador Odoo`)
+    }
+  }
+
+  return { released, marked, adjusted }
+}
+
 module.exports = {
   validateAndReserve,
   confirmReservations,
@@ -417,6 +485,7 @@ module.exports = {
   markReservationsAwaitingStockSync,
   releaseDeductedReservationsCoveredByStockSync,
   releaseActiveReservations,
+  applyOdooOrderStateToReservations,
   failReservations,
   expireOldReservations,
 }

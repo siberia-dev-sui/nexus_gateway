@@ -195,26 +195,53 @@ async function processPriceSyncQueue(odooPost, options = {}) {
         continue
       }
 
-      const snapshot = await odooPost('/nexus/api/v1/pricelist_snapshot', {
-        pricelist_id: job.pricelist_id,
-        company_id: job.company_id,
-      })
+      // Paginar el snapshot para no exceder el timeout del worker HTTP de
+      // Odoo (antes el endpoint duraba >900s y mataba threads). Bloque de 500.
+      const PAGE_SIZE = 500
+      let offset = 0
+      let combinedSnapshot = null
+      const allPrices = []
+      let hadError = false
 
-      if (snapshot?.error) {
-        const msg = String(snapshot.error)
-        if (msg.includes('no encontrados') || msg.includes('no encontrada')) {
-          await query(
-            'DELETE FROM pricelist_prices WHERE pricelist_id = $1 AND company_id = $2',
-            [job.pricelist_id, job.company_id]
-          )
-          await markQueueStatus(job.pricelist_id, job.company_id, 'DONE')
-          skipped++
-          continue
+      while (true) {
+        const snapshot = await odooPost('/nexus/api/v1/pricelist_snapshot', {
+          pricelist_id: job.pricelist_id,
+          company_id: job.company_id,
+          limit: PAGE_SIZE,
+          offset,
+        })
+
+        if (snapshot?.error) {
+          const msg = String(snapshot.error)
+          if (msg.includes('no encontrados') || msg.includes('no encontrada')) {
+            await query(
+              'DELETE FROM pricelist_prices WHERE pricelist_id = $1 AND company_id = $2',
+              [job.pricelist_id, job.company_id]
+            )
+            await markQueueStatus(job.pricelist_id, job.company_id, 'DONE')
+            skipped++
+            hadError = true
+            break
+          }
+          throw new Error(msg)
         }
-        throw new Error(msg)
+
+        if (!combinedSnapshot) {
+          combinedSnapshot = { ...snapshot }
+        }
+        const pagePrices = Array.isArray(snapshot.prices) ? snapshot.prices : []
+        allPrices.push(...pagePrices)
+
+        if (!snapshot.has_more) break
+        offset += pagePrices.length || PAGE_SIZE
       }
 
-      await replacePricelistPrices(snapshot)
+      if (hadError) continue
+      if (combinedSnapshot) {
+        combinedSnapshot.prices = allPrices
+        combinedSnapshot.count = allPrices.length
+        await replacePricelistPrices(combinedSnapshot)
+      }
 
       const state = await query(
         'SELECT dirty FROM pricelist_sync_queue WHERE pricelist_id = $1 AND company_id = $2',
