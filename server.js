@@ -18,6 +18,7 @@ const { syncVendorOrders } = require('./crons/sync_vendor_orders')
 const { syncStock } = require('./crons/sync_stock')
 const { syncProductImages } = require('./crons/sync_product_images')
 const { syncPaymentJournals } = require('./crons/sync_payment_journals')
+const { backfillVendorSuggestions } = require('./crons/order_suggestions')
 const {
   validateAndReserve,
   failReservations,
@@ -993,6 +994,57 @@ fastify.get('/api/v1/vendor/journals', { preHandler: [verifyToken] }, async (req
     status:   'ok',
     count:    rows.length,
     journals: rows,
+  }
+})
+
+// ── SUGERENCIAS DE PEDIDO (offline-first, lee del cache local) ──────────────
+//
+// La app consulta este endpoint en sus triggers de sync (login, pull-to-
+// refresh, WorkManager) y guarda el resultado en su SQLite. Al entrar al
+// paso "Pedido" del wizard, lee de su cache local sin red.
+//
+// El cache del gateway se mantiene fresco por el worker tras cada
+// VISIT_COMPLETED (event-driven). Si un vendedor consulta y no tiene cache
+// (vendedor nuevo, restore de DB, etc.), disparamos backfill async.
+
+fastify.get('/api/v1/vendor/order_suggestions', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { vendedor_id: vendorId, uuid: vendorUuid } = request.user
+
+  let rows
+  try {
+    const result = await query(
+      `SELECT client_id, product_id, target, last_post, updated_at
+         FROM order_suggestions_cache
+        WHERE vendor_id = $1
+        ORDER BY client_id, product_id`,
+      [vendorId]
+    )
+    rows = result.rows
+  } catch (err) {
+    fastify.log.error(`[GET /vendor/order_suggestions] Error: ${err.message}`)
+    return reply.code(500).send({ error: 'Error al consultar sugerencias' })
+  }
+
+  // Si está vacío, disparar backfill async (no bloquea esta respuesta).
+  // La app recibirá lista vacía esta vez, en la próxima sync ya tendrá data.
+  if (rows.length === 0) {
+    backfillVendorSuggestions(odooPost, vendorUuid, vendorId)
+      .catch((err) => fastify.log.warn(
+        `[SUGGESTIONS] backfill async falló: ${err.message}`
+      ))
+  }
+
+  return {
+    status:      'ok',
+    count:       rows.length,
+    synced_at:   new Date().toISOString(),
+    suggestions: rows.map((r) => ({
+      client_id:  r.client_id,
+      product_id: r.product_id,
+      target:     parseFloat(r.target),
+      last_post:  parseFloat(r.last_post),
+      updated_at: r.updated_at,
+    })),
   }
 })
 

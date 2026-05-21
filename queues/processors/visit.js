@@ -1,4 +1,5 @@
 const { query } = require('../../db')
+const { refreshSuggestionsFor } = require('../../crons/order_suggestions')
 
 async function processVisit(job, odooPost) {
   const { tipo, payload, clientUuid } = job.data
@@ -10,15 +11,16 @@ async function processVisit(job, odooPost) {
     notas
   } = payload
 
-  // ── Resolver vendor_nexus_uuid (PostgreSQL — no toca Odoo) ──
+  // ── Resolver vendor (uuid + id) desde PostgreSQL — no toca Odoo ──
   const vendorRow = await query(
-    `SELECT v.uuid AS vendor_uuid
+    `SELECT v.id AS vendor_id, v.uuid AS vendor_uuid
      FROM outbox o
      JOIN vendedores v ON v.id = o.vendedor_id
      WHERE o.client_uuid = $1`,
     [clientUuid]
   )
   const vendorNexusUuid = vendorRow.rows[0]?.vendor_uuid || null
+  const vendorId = vendorRow.rows[0]?.vendor_id || null
 
   if (tipo === 'VISIT_COMPLETED') {
     const result = await odooPost('/nexus/api/v1/create_visit', {
@@ -55,6 +57,18 @@ async function processVisit(job, odooPost) {
     )
 
     console.log(`[VISIT] ✅ COMPLETED ${clientUuid} → Odoo visit ID: ${result.visit_id}`)
+
+    // Event-driven: refrescar las sugerencias de pedido para este par
+    // (vendor, client) en el cache del gateway. No bloqueamos el worker
+    // si esto falla — el cache eventualmente se actualizaría en la
+    // próxima visita o via backfill.
+    if (vendorNexusUuid && vendorId && cliente_odoo_id) {
+      refreshSuggestionsFor(odooPost, vendorNexusUuid, cliente_odoo_id, vendorId)
+        .catch((err) => console.warn(
+          `[VISIT] No se pudo refrescar sugerencias post-VISIT_COMPLETED: ${err.message}`
+        ))
+    }
+
     return { status: 'DONE', odoo_visit_id: result.visit_id }
   }
 
