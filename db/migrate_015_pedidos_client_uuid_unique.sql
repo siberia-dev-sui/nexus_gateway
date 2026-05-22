@@ -10,5 +10,18 @@ USING pedidos p2
 WHERE p.client_uuid = p2.client_uuid
   AND p.id > p2.id;
 
-ALTER TABLE pedidos
-  ADD CONSTRAINT pedidos_client_uuid_uniq UNIQUE (client_uuid);
+-- Agregar la restricción solo si no existe (migración idempotente: poder
+-- re-ejecutar este archivo sin fallar con "relation already exists").
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conname = 'pedidos_client_uuid_uniq'
+       AND conrelid = 'pedidos'::regclass
+  ) THEN
+    ALTER TABLE pedidos
+      ADD CONSTRAINT pedidos_client_uuid_uniq UNIQUE (client_uuid);
+  END IF;
+END
+$$;
