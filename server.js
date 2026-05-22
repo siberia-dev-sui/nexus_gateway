@@ -1171,8 +1171,15 @@ fastify.post('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (r
       name:                 result.name,
     }
   } catch (err) {
-    fastify.log.error(`[POST /payment_requests] Error: ${err.message}`)
-    return reply.code(502).send({ error: 'No se pudo crear la solicitud en Odoo' })
+    // Propagar el detalle real al cliente — antes se tragaba con un genérico
+    // "No se pudo crear la solicitud en Odoo" (HTTP 502) que ocultaba causas
+    // típicas (factura inexistente, monto excedido, journal inválido, etc.).
+    // err.message viene de odooPost() que ya extrae el message del JSON-RPC.
+    const detail = (err && err.message) ? String(err.message) : 'Error desconocido'
+    fastify.log.error(`[POST /payment_requests] Odoo error: ${detail}`)
+    return reply.code(502).send({
+      error: `Odoo rechazó la solicitud: ${detail}`,
+    })
   }
 })
 
