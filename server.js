@@ -530,6 +530,14 @@ async function runGatewaySync(name, options = {}) {
         return runPriceBookSyncCycle({ processAll: true })
       case 'product-images':
         return syncProductImages(odooPost, options)
+      case 'catalog': {
+        // Invalida el cache Redis del catálogo. La próxima request al gateway
+        // re-fetcha desde Odoo (trayendo cualquier campo nuevo agregado al
+        // endpoint, ej. barcode). No bloquea — solo borra claves.
+        const keys = await redis.keys('catalog:products:*')
+        if (keys.length) await redis.del(...keys)
+        return { invalidated_keys: keys.length, keys }
+      }
       case 'outbox':
         return {
           requeued: await requeueOutboxBacklog(),
@@ -537,7 +545,7 @@ async function runGatewaySync(name, options = {}) {
         }
       case 'all': {
         const results = {}
-        for (const item of ['vendors', 'clients', 'companies', 'orders', 'journals', 'prices', 'product-images', 'stock-delta', 'outbox']) {
+        for (const item of ['catalog', 'vendors', 'clients', 'companies', 'orders', 'journals', 'prices', 'product-images', 'stock-delta', 'outbox']) {
           results[item] = await runGatewaySync(item, options)
         }
         return results
