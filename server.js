@@ -704,7 +704,8 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
   const result = await query(
     `SELECT c.odoo_id, c.nombre, c.rif, c.telefono, c.direccion,
             c.lat, c.lng, c.bloqueado, c.credito_restringido,
-            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado
+            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado,
+            c.delivery_addresses, c.default_delivery_id
      FROM clientes c
      INNER JOIN vendedor_cliente_rel vcr ON vcr.cliente_odoo_id = c.odoo_id
      WHERE vcr.vendedor_id = $1
@@ -727,6 +728,8 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
     credito_limite:      parseFloat(c.credito_limite  || 0),
     credito_usado:       parseFloat(c.credito_usado   || 0),
     credito_disponible:  parseFloat((c.credito_limite || 0) - (c.credito_usado || 0)),
+    delivery_addresses:  Array.isArray(c.delivery_addresses) ? c.delivery_addresses : [],
+    default_delivery_id: c.default_delivery_id || c.odoo_id,
   }))
 
   return { status: 'ok', count: clientes.length, clientes }
@@ -1219,7 +1222,8 @@ fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (reque
   const updated = await query(
     `SELECT c.odoo_id, c.nombre, c.rif, c.telefono, c.direccion,
             c.lat, c.lng, c.bloqueado, c.credito_restringido,
-            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado
+            c.motivo_bloqueo, c.canal, c.credito_limite, c.credito_usado,
+            c.delivery_addresses, c.default_delivery_id
      FROM clientes c
      INNER JOIN vendedor_cliente_rel vcr ON vcr.cliente_odoo_id = c.odoo_id
      WHERE vcr.vendedor_id = $1
@@ -1242,6 +1246,8 @@ fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (reque
     credito_limite:      parseFloat(c.credito_limite  || 0),
     credito_usado:       parseFloat(c.credito_usado   || 0),
     credito_disponible:  parseFloat((c.credito_limite || 0) - (c.credito_usado || 0)),
+    delivery_addresses:  Array.isArray(c.delivery_addresses) ? c.delivery_addresses : [],
+    default_delivery_id: c.default_delivery_id || c.odoo_id,
   }))
 
   fastify.log.info(`[SYNC_CLIENTS_MANUAL] vendedor_id=${vendedor_id} clientes=${clientes.length}`)

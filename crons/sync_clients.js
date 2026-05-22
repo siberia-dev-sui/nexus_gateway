@@ -1,10 +1,15 @@
 const { query } = require('../db')
 
 async function upsertClient(client) {
+  const deliveries = Array.isArray(client.delivery_addresses)
+    ? client.delivery_addresses
+    : []
+  const defaultDeliveryId = client.default_delivery_id || null
   await query(
     `INSERT INTO clientes (odoo_id, nombre, rif, telefono, direccion, lat, lng,
-                           bloqueado, credito_restringido, motivo_bloqueo, canal, last_sync)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                           bloqueado, credito_restringido, motivo_bloqueo, canal,
+                           delivery_addresses, default_delivery_id, last_sync)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW())
      ON CONFLICT (odoo_id) DO UPDATE SET
        nombre              = EXCLUDED.nombre,
        rif                 = EXCLUDED.rif,
@@ -16,6 +21,8 @@ async function upsertClient(client) {
        credito_restringido = EXCLUDED.credito_restringido,
        motivo_bloqueo      = EXCLUDED.motivo_bloqueo,
        canal               = EXCLUDED.canal,
+       delivery_addresses  = EXCLUDED.delivery_addresses,
+       default_delivery_id = EXCLUDED.default_delivery_id,
        last_sync           = NOW()`,
     [
       client.odoo_id,
@@ -29,6 +36,8 @@ async function upsertClient(client) {
       client.credito_restringido || false,
       client.motivo_bloqueo || null,
       client.canal || null,
+      JSON.stringify(deliveries),
+      defaultDeliveryId,
     ]
   )
 }

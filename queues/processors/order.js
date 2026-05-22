@@ -6,7 +6,10 @@ const PRICE_TOLERANCE = 0.05
 
 async function processOrder(job, odooPost) {
   const { payload, clientUuid } = job.data
-  const { cliente_odoo_id, lines, visita_uuid, company_id } = payload
+  const {
+    cliente_odoo_id, lines, visita_uuid, company_id,
+    delivery_address_id,
+  } = payload
   const vendedor_id = payload.vendedor_id || job.data.vendedor_id
 
   // ── Validación de precios (price book local — no toca Odoo) ──────
@@ -115,11 +118,12 @@ async function processOrder(job, odooPost) {
   // El módulo confirma el pedido internamente — no llamar action_confirm.
   // La respuesta ya trae order_id y name — no llamar odoo read.
   const result = await odooPost('/nexus/api/v1/create_order', {
-    client_uuid:       clientUuid,
+    client_uuid:         clientUuid,
     cliente_odoo_id,
-    visita_uuid:       visita_uuid || null,
-    vendor_nexus_uuid: vendorNexusUuid,
-    company_id:        company_id || null,
+    visita_uuid:         visita_uuid || null,
+    vendor_nexus_uuid:   vendorNexusUuid,
+    company_id:          company_id || null,
+    delivery_address_id: delivery_address_id || null,
     lines: lines.map(l => ({
       product_id: l.product_id,
       qty:        l.qty,
