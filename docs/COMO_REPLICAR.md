@@ -1,87 +1,130 @@
-# Cómo replicar el servidor NEXUS Gateway (staging / nuevo servidor)
+# Cómo replicar el servidor NEXUS Gateway (staging)
 
-Guía para levantar una copia exacta de este servidor en una máquina nueva.
-Basada en la configuración actual de producción: `nexus.eqnio.com` / IP `77.42.71.221`.
+Este documento explica cómo levantar una copia exacta del servidor de producción
+en una máquina nueva, y qué cambiar para que el staging no tenga conflictos con producción.
+
+**Servidor de producción de referencia:**
+- IP: `77.42.71.221`
+- Dominio: `nexus.eqnio.com`
+- Rama: `main`
 
 ---
 
-## Requisitos del servidor nuevo
+## Qué cambia en staging vs producción
+
+Estos son los únicos puntos donde staging debe diferenciarse de producción.
+Todo lo demás es idéntico.
+
+| Qué                  | Producción                                | Staging                          |
+|----------------------|-------------------------------------------|----------------------------------|
+| Dominio              | `nexus.eqnio.com`                         | dominio nuevo (ej: `staging-nexus.eqnio.com`) |
+| IP del servidor      | `77.42.71.221`                            | IP del servidor nuevo            |
+| `ODOO_URL`           | `https://equinocciodev-gleiros.odoo.com`  | URL del Odoo de staging          |
+| `ODOO_DB`            | `equinocciodev-gleiros-main-13911622`     | DB del Odoo de staging           |
+| `JWT_SECRET`         | (valor de producción)                     | **valor distinto** — si es igual, tokens de staging serían válidos en producción |
+| `NEXUS_ADMIN_TOKEN`  | (valor de producción)                     | **valor distinto** — mismo motivo |
+| `POSTGRES_PASSWORD`  | (valor de producción)                     | puede ser el mismo, es interno   |
+| `REDIS_PASSWORD`     | (valor de producción)                     | puede ser el mismo, es interno   |
+| Rama git             | `main`                                    | `staging`                        |
+| `NEXUS_ENABLE_SYNC_CRONS` | `true`                               | `false` recomendado al inicio para no saturar Odoo de staging |
+
+---
+
+## Paso a paso
+
+### 1. Servidor nuevo — requisitos
 
 - Ubuntu 24.04 LTS
 - 2 vCPU, 4 GB RAM (Hetzner CX22 o equivalente)
-- Docker + Docker Compose plugin
-- Git
-- Puertos 80 y 443 abiertos al público
-- Un dominio apuntando a la IP del servidor nuevo (registro A en DNS)
+- Docker + Docker Compose plugin instalados
+- Puertos 80 y 443 abiertos
+- Un dominio o subdominio apuntando a la IP del servidor nuevo (registro A en DNS)
 
----
-
-## 1. Instalar Docker
-
+Instalar Docker si no está:
 ```bash
 curl -fsSL https://get.docker.com | sh
 ```
 
 ---
 
-## 2. Clonar el repositorio
+### 2. Clonar el repositorio en rama staging
 
 ```bash
 git clone git@github.com:siberia-dev-sui/nexus_gateway.git /opt/nexus_gateway
 cd /opt/nexus_gateway
-```
-
-Para staging, cambiar a la rama correspondiente:
-
-```bash
 git checkout staging
 ```
 
 ---
 
-## 3. Configurar variables de entorno
+### 3. Crear el .env con los valores de staging
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Completar con los valores del servidor de referencia (pedir al equipo):
+Completar así — los valores marcados con ⚠️ deben ser distintos a producción:
 
 ```env
-POSTGRES_PASSWORD=
-REDIS_PASSWORD=
-JWT_SECRET=
-NEXUS_ADMIN_TOKEN=
-ODOO_URL=
-ODOO_DB=
-ODOO_BOT_EMAIL=
-ODOO_BOT_PASSWORD=
-DEMO_EMAIL=
 PORT=3000
+
+# Odoo de STAGING (no el de producción)
+ODOO_URL=https://TU-ODOO-STAGING.odoo.com
+ODOO_DB=nombre-de-la-db-staging
+ODOO_BOT_EMAIL=admin
+ODOO_BOT_PASSWORD=contraseña-del-bot-en-odoo-staging
+
+DEMO_EMAIL=bot_ventas@leiros.com
+
+# ⚠️ DISTINTO A PRODUCCIÓN — si es igual, tokens de staging valen en prod
+JWT_SECRET=staging-secret-largo-y-aleatorio
+
+# ⚠️ DISTINTO A PRODUCCIÓN — token compartido con el módulo Odoo de staging
+NEXUS_ADMIN_TOKEN=staging-admin-token
+
+# PostgreSQL (interno al servidor, puede ser cualquier contraseña)
+POSTGRES_PASSWORD=staging-postgres-password
+POSTGRES_URL=postgresql://nexus:staging-postgres-password@nexus_postgres:5432/nexus
+
+# Redis (interno al servidor)
+REDIS_PASSWORD=staging-redis-password
+REDIS_URL=redis://:staging-redis-password@nexus_redis:6379
+REDIS_HOST=nexus_redis
+
+# Sync — recomendado false al inicio para no saturar Odoo de staging
 NEXUS_AUTO_SYNC_ON_START=false
-NEXUS_ENABLE_SYNC_CRONS=true
+NEXUS_ENABLE_SYNC_CRONS=false
+
+ENABLE_BULLMQ_WORKER=false
+ENFORCE_PRICE_VALIDATION=false
 ```
 
 ---
 
-## 4. Configurar nginx con el dominio nuevo
+### 4. Configurar nginx con el dominio de staging
 
-Editar `/opt/nexus_gateway/nginx/nginx.conf` y reemplazar `nexus.eqnio.com` con el dominio del servidor nuevo:
+Editar `nginx/nginx.conf` y reemplazar `nexus.eqnio.com` con el dominio de staging:
+
+```bash
+nano /opt/nexus_gateway/nginx/nginx.conf
+```
+
+El archivo debe quedar así (reemplazar `TU-DOMINIO-STAGING.com`):
 
 ```nginx
 server {
     listen 80;
-    server_name TU-DOMINIO.com;
+    server_name TU-DOMINIO-STAGING.com;
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl;
-    server_name TU-DOMINIO.com;
+    server_name TU-DOMINIO-STAGING.com;
 
-    ssl_certificate     /etc/letsencrypt/live/TU-DOMINIO.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/TU-DOMINIO.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/TU-DOMINIO-STAGING.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/TU-DOMINIO-STAGING.com/privkey.pem;
 
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
@@ -96,27 +139,30 @@ server {
 }
 ```
 
+> ⚠️ No tocar `nginx/nginx.conf` en el repo — editar solo el archivo local en el servidor nuevo.
+> Si se hace commit de ese cambio, pisaría la config de producción en la rama.
+
 ---
 
-## 5. Obtener certificado SSL (Let's Encrypt)
+### 5. Obtener certificado SSL
 
-Antes de levantar Docker, obtener el certificado con el puerto 80 libre:
+Con el puerto 80 libre (antes de levantar Docker):
 
 ```bash
 sudo apt install certbot -y
-sudo certbot certonly --standalone -d TU-DOMINIO.com --agree-tos --no-eff-email
+sudo certbot certonly --standalone -d TU-DOMINIO-STAGING.com --agree-tos --no-eff-email
 ```
 
-Verificar que los certificados quedaron en:
+Verificar:
 
 ```bash
-ls /etc/letsencrypt/live/TU-DOMINIO.com/
+ls /etc/letsencrypt/live/TU-DOMINIO-STAGING.com/
 # fullchain.pem  privkey.pem
 ```
 
 ---
 
-## 6. Levantar los contenedores
+### 6. Levantar los contenedores
 
 ```bash
 cd /opt/nexus_gateway
@@ -127,12 +173,15 @@ Verificar que los 4 contenedores están corriendo:
 
 ```bash
 docker ps
-# nexus_gateway, nexus_nginx, nexus_postgres, nexus_redis
+# nexus_gateway   Up
+# nexus_nginx     Up
+# nexus_postgres  Up
+# nexus_redis     Up
 ```
 
 ---
 
-## 7. Correr las migraciones de base de datos
+### 7. Correr las migraciones de base de datos
 
 ```bash
 for f in db/migrate_*.sql; do
@@ -141,58 +190,63 @@ for f in db/migrate_*.sql; do
 done
 ```
 
+Las migraciones son idempotentes — se pueden correr más de una vez sin problema.
+
 ---
 
-## 8. Verificar que el gateway responde
+### 8. Verificar que responde
 
 ```bash
-curl https://TU-DOMINIO.com/api/v1/health
+curl https://TU-DOMINIO-STAGING.com/api/v1/health
 # {"status":"ok"}
 ```
 
 ---
 
-## 9. Sincronización inicial desde Odoo
+### 9. Sync inicial desde Odoo de staging
 
-Disparar el sync manual desde el panel admin para poblar la base de datos:
+Una vez verificado, poblar la base de datos desde el panel admin:
 
-```bash
-curl -X POST https://TU-DOMINIO.com/api/v1/admin/sync/all \
-  -H "X-Nexus-Admin-Token: TU_ADMIN_TOKEN"
+```
+https://TU-DOMINIO-STAGING.com/admin/sync
 ```
 
-O desde el navegador en: `https://TU-DOMINIO.com/admin/sync`
+O por curl:
+
+```bash
+curl -X POST https://TU-DOMINIO-STAGING.com/api/v1/admin/sync/all \
+  -H "X-Nexus-Admin-Token: TU_STAGING_ADMIN_TOKEN"
+```
+
+Después de esto activar los crons en el `.env`:
+
+```env
+NEXUS_ENABLE_SYNC_CRONS=true
+```
+
+Y reiniciar el gateway:
+
+```bash
+docker compose restart gateway
+```
 
 ---
 
-## Actualizaciones y deploy
+## Actualizaciones en staging
 
-Para deployar una nueva versión en cualquier momento:
+Para traer cambios nuevos de la rama staging:
 
 ```bash
 cd /opt/nexus_gateway
 ./deploy.sh
 ```
 
-El script hace `git pull`, rebuild del contenedor gateway, restart y aplica migraciones nuevas.
-
----
-
-## Estructura de contenedores
-
-| Contenedor      | Imagen                  | Puerto        |
-|-----------------|-------------------------|---------------|
-| nexus_gateway   | nexus_gateway-gateway   | 3000 interno  |
-| nexus_nginx     | nginx:alpine            | 80 y 443      |
-| nexus_postgres  | postgres:16-alpine      | 5432 interno  |
-| nexus_redis     | redis:7-alpine          | 6379 interno  |
-
 ---
 
 ## Troubleshooting
 
 ```bash
-# Logs del gateway
+# Logs del gateway en tiempo real
 docker logs -f nexus_gateway
 
 # Logs de nginx
