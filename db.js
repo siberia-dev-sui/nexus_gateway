@@ -6,9 +6,12 @@ const Redis = require('ioredis')
 // ─────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.POSTGRES_URL,
-  max: 10,
+  // 25 conexiones: con ~50 vendedores sincronizando a la vez, max=10 hacía
+  // cola en pool.connect() y la latencia se acumulaba en cascada.
+  max: 25,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000
+  connectionTimeoutMillis: 5000,
+  keepAlive: true
 })
 
 pool.on('error', (err) => {

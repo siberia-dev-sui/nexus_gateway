@@ -106,12 +106,77 @@ async function _validateAndReserveOrder({ orderUuid, vendorId, payload }) {
   })
 }
 
+// Tiempo máximo que un vendedor espera en línea por la creación del pedido
+// en Odoo. Si Odoo tarda más, respondemos PROCESSING (la app ya maneja ese
+// estado: hace polling de /sync/status) y el procesamiento continúa en
+// background — el outbox termina en DONE o FAILED igual que antes.
+const ORDER_SOFT_TIMEOUT_MS = 15000
+
+async function runOrderWithSoftTimeout(clientUuid, task) {
+  // El manejo de error queda adherido a la promesa ANTES del race: si el
+  // timeout gana y processOrder falla después, la reserva se libera y el
+  // outbox se marca FAILED igual — sin unhandled rejection.
+  const guarded = task.then(
+    (r) => ({
+      status: r.status || 'DONE',
+      odoo_order_id: r.odoo_order_id,
+      odoo_order_name: r.odoo_order_name,
+    }),
+    async (err) => {
+      try {
+        await failReservations(clientUuid, err.message)
+        await query(
+          `UPDATE outbox
+             SET estado = 'FAILED', retry_count = retry_count + 1,
+                 error_msg = $1, updated_at = NOW()
+           WHERE client_uuid = $2`,
+          [err.message, clientUuid]
+        )
+      } catch (cleanupErr) {
+        fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${clientUuid}: error en cleanup: ${cleanupErr.message}`)
+      }
+      fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${clientUuid}: ${err.stack || err.message}`)
+      return { status: 'FAILED', error: err.message }
+    }
+  )
+  return Promise.race([
+    guarded,
+    new Promise((resolve) => {
+      const t = setTimeout(() => {
+        fastify.log.warn(`[SYNC_PUSH] ORDER_CREATED ${clientUuid}: Odoo lento (>${ORDER_SOFT_TIMEOUT_MS}ms) — respondiendo PROCESSING, sigue en background`)
+        resolve({ status: 'PROCESSING', soft_timeout: true })
+      }, ORDER_SOFT_TIMEOUT_MS)
+      if (t.unref) t.unref()
+    }),
+  ])
+}
+
 async function verifyToken(request, reply) {
   try {
     await request.jwtVerify()
   } catch (err) {
     reply.send(err)
   }
+}
+
+/**
+ * Responde con ETag y honra If-None-Match: si el cliente ya tiene esta
+ * versión exacta del payload, devuelve 304 sin cuerpo. En los refreshes
+ * de la app donde nada cambió (catálogo, price book, clientes), la
+ * respuesta pasa de cientos de KB a 0 bytes.
+ */
+function sendWithEtag(request, reply, payload) {
+  const body = JSON.stringify(payload)
+  const etag = `"${crypto.createHash('sha1').update(body).digest('hex')}"`
+  reply.header('ETag', etag)
+  // nginx degrada el ETag a débil (W/"...") al aplicar gzip, y el cliente
+  // devuelve lo que recibió — comparamos sin el prefijo W/.
+  const clientTag = String(request.headers['if-none-match'] || '').replace(/^W\//, '')
+  if (clientTag === etag) {
+    return reply.code(304).send()
+  }
+  reply.type('application/json; charset=utf-8')
+  return reply.send(body)
 }
 
 // ─────────────────────────────────────────
@@ -655,9 +720,9 @@ fastify.post('/api/v1/admin/sync/:name', { preHandler: [verifyAdminToken] }, asy
 
 // ── CATALOG ───────────────────────────────
 
-fastify.get('/api/v1/catalog', async () => {
+fastify.get('/api/v1/catalog', async (request, reply) => {
   const { products, cached } = await getCatalog()
-  return { status: 'ok', count: products.length, products, cached }
+  return sendWithEtag(request, reply, { status: 'ok', count: products.length, products, cached })
 })
 
 // ── PRODUCT IMAGE ─────────────────────────
@@ -673,11 +738,18 @@ fastify.get('/api/v1/product/:id/image', async (request, reply) => {
     const image = result.rows[0]
     if (!image) return reply.code(404).send()
 
-    reply.header('Content-Type', image.mimetype || 'image/png')
-    reply.header('Cache-Control', 'public, max-age=86400')
+    // 7 días de cache en el dispositivo + nginx (immutable hasta que el
+    // write_date cambie, que rota el ETag).
+    reply.header('Cache-Control', 'public, max-age=604800')
     if (image.write_date) {
-      reply.header('ETag', `"product-${request.params.id}-${new Date(image.write_date).getTime()}"`)
+      const etag = `"product-${request.params.id}-${new Date(image.write_date).getTime()}"`
+      reply.header('ETag', etag)
+      const clientTag = String(request.headers['if-none-match'] || '').replace(/^W\//, '')
+      if (clientTag === etag) {
+        return reply.code(304).send()
+      }
     }
+    reply.header('Content-Type', image.mimetype || 'image/png')
     return reply.send(Buffer.from(image.image_data))
   } catch {
     reply.code(404).send()
@@ -686,14 +758,17 @@ fastify.get('/api/v1/product/:id/image', async (request, reply) => {
 
 // ── SYNC ──────────────────────────────────
 
-fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async (request) => {
+fastify.get('/api/v1/sync/initial', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id } = request.user
   const productIds = await getVendorCatalogProductIds(vendedor_id)
   if (!productIds.length) {
     return { status: 'ok', count: 0, products: [], cached: false }
   }
   const { products, cached } = await getCatalog(productIds)
-  return { status: 'ok', count: products.length, products, cached }
+  // `cached` fuera del cuerpo hasheado cambiaría el ETag sin cambiar los
+  // datos — pero su valor depende del Redis TTL, no de los productos.
+  // Lo dejamos: el costo es un ETag distinto 1 vez por hora como máximo.
+  return sendWithEtag(request, reply, { status: 'ok', count: products.length, products, cached })
 })
 
 // ── CLIENTES DEL VENDEDOR ─────────────────
@@ -732,7 +807,7 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
     default_delivery_id: c.default_delivery_id || c.odoo_id,
   }))
 
-  return { status: 'ok', count: clientes.length, clientes }
+  return sendWithEtag(request, reply, { status: 'ok', count: clientes.length, clientes })
 })
 
 // ── PRICE BOOK DEL VENDEDOR ──────────────────────────────────────────────────
@@ -740,10 +815,12 @@ fastify.get('/api/v1/clients', { preHandler: [verifyToken] }, async (request, re
 fastify.get('/api/v1/prices/book', { preHandler: [verifyToken] }, async (request, reply) => {
   const { vendedor_id } = request.user
   const book = await getVendorPriceBook(vendedor_id)
-  return {
+  // synced_at del book deriva del max(updated_at) de los datos (no del
+  // reloj), así que el ETag es estable mientras los precios no cambien.
+  return sendWithEtag(request, reply, {
     status: 'ok',
     ...book,
-  }
+  })
 })
 
 fastify.post('/api/v1/prices/sync', { preHandler: [verifyToken] }, async (request, reply) => {
@@ -798,6 +875,30 @@ async function upsertVendorOrderCache(vendorUuid, order) {
   )
 }
 
+// Trae órdenes frescas de Odoo y actualiza el cache local. Usado como
+// refresh en background por GET /orders — los errores solo se loguean.
+const _ordersRefreshInFlight = new Map() // vendor_uuid → timestamp del último refresh
+
+async function refreshVendorOrdersFromOdoo(uuid, { limit, offset, state, search }) {
+  const last = _ordersRefreshInFlight.get(uuid)
+  if (last && Date.now() - last < 30 * 1000) return // throttle: 1 refresh / 30s / vendedor
+  _ordersRefreshInFlight.set(uuid, Date.now())
+
+  const result = await odooPost('/nexus/api/v1/vendor_orders', {
+    vendor_nexus_uuid: uuid,
+    limit,
+    offset,
+    state,
+    search,
+  })
+  const liveOrders = result?.orders || []
+  for (const order of liveOrders) {
+    await upsertVendorOrderCache(uuid, order)
+  }
+  await reconcileOrdersFromOdooOrders(liveOrders)
+  return liveOrders
+}
+
 fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, reply) => {
   const { uuid } = request.user
   const limit = Math.min(Math.max(Number(request.query.limit || 30), 1), 100)
@@ -805,30 +906,33 @@ fastify.get('/api/v1/orders', { preHandler: [verifyToken] }, async (request, rep
   const state = request.query.state || null
   const search = request.query.search || null
 
-  try {
-    const result = await odooPost('/nexus/api/v1/vendor_orders', {
-      vendor_nexus_uuid: uuid,
-      limit,
-      offset,
-      state,
-      search,
-    })
-    const liveOrders = result?.orders || []
-    for (const order of liveOrders) {
-      await upsertVendorOrderCache(uuid, order)
+  // Cache-first: si hay cache local, responder de inmediato (sin esperar a
+  // Odoo, que puede tardar hasta 30s) y refrescar en background — la
+  // siguiente consulta de la app ya verá lo nuevo. Solo si el cache está
+  // vacío (vendedor nuevo / primer uso) se consulta Odoo en línea.
+  const hasCache = await query(
+    'SELECT 1 FROM vendor_orders_cache WHERE vendor_uuid = $1 LIMIT 1',
+    [uuid]
+  )
+
+  if (!hasCache.rows.length) {
+    try {
+      const liveOrders = await refreshVendorOrdersFromOdoo(uuid, { limit, offset, state, search })
+      return {
+        status: 'ok',
+        source: 'odoo_live',
+        orders: liveOrders || [],
+        count: liveOrders?.length || 0,
+        total: liveOrders?.length || 0,
+        limit,
+        offset,
+      }
+    } catch (err) {
+      fastify.log.warn(`[GET /orders] Odoo no disponible, usando cache local: ${err.message}`)
     }
-    await reconcileOrdersFromOdooOrders(liveOrders)
-    return {
-      status: 'ok',
-      source: 'odoo_live',
-      orders: liveOrders,
-      count: result?.count || liveOrders.length,
-      total: result?.total || 0,
-      limit: result?.limit || limit,
-      offset: result?.offset || offset,
-    }
-  } catch (err) {
-    fastify.log.warn(`[GET /orders] Odoo no disponible, usando cache local: ${err.message}`)
+  } else {
+    refreshVendorOrdersFromOdoo(uuid, { limit, offset, state, search })
+      .catch((err) => fastify.log.warn(`[GET /orders] refresh background falló: ${err.message}`))
   }
 
   const conditions = ['vendor_uuid = $1']
@@ -1612,13 +1716,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT (client_uuid) DO NOTHING`,
             [client_uuid, vendedor_id, payload.cliente_odoo_id, payload.total || 0, payload.notas || null]
           )
-          const result = await processOrder(
-            { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
-            odooPost
-          )
-          results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
         } catch (err) {
-          // Liberar reserva — Odoo rechazó o algo falló
+          // Liberar reserva — falló antes de llegar a Odoo
           await failReservations(client_uuid, err.message)
           await query(
             `UPDATE outbox
@@ -1629,7 +1728,16 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           )
           fastify.log.error(`[SYNC_PUSH] ORDER_CREATED ${client_uuid}: ${err.stack || err.message}`)
           results.push({ client_uuid, status: 'FAILED', error: err.message })
+          continue
         }
+        const result = await runOrderWithSoftTimeout(
+          client_uuid,
+          processOrder(
+            { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+            odooPost
+          )
+        )
+        results.push({ client_uuid, ...result })
         continue
       }
 
@@ -1764,14 +1872,8 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
           results.push({ client_uuid, status: 'PROCESSING', skipped: true })
           continue
         }
-        const result = await processOrder(
-          { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
-          odooPost
-        )
-        results.push({ client_uuid, status: result.status || 'DONE', odoo_order_id: result.odoo_order_id, odoo_order_name: result.odoo_order_name })
-        continue
       } catch (err) {
-        // Liberar reserva — Odoo rechazó o algo falló al procesar
+        // Liberar reserva — falló antes de llegar a Odoo
         await failReservations(client_uuid, err.message)
         await query(
           `UPDATE outbox
@@ -1784,6 +1886,15 @@ fastify.post('/api/v1/sync/push', { preHandler: [verifyToken] }, async (request,
         results.push({ client_uuid, status: 'FAILED', error: err.message })
         continue
       }
+      const result = await runOrderWithSoftTimeout(
+        client_uuid,
+        processOrder(
+          { data: { tipo, payload: { ...payload, vendedor_id }, clientUuid: client_uuid, vendedor_id } },
+          odooPost
+        )
+      )
+      results.push({ client_uuid, ...result })
+      continue
     }
 
     if (tipo === 'VISIT_COMPLETED') {
@@ -1851,38 +1962,31 @@ fastify.get('/api/v1/sync/status', { preHandler: [verifyToken] }, async (request
   if (!uuids) return reply.code(400).send({ error: 'uuids requerido (comma-separated)' })
 
   const uuidList = uuids.split(',').map(u => u.trim()).filter(Boolean)
+  // Un solo query con LEFT JOIN al cache de pedidos — antes era 1 query por
+  // cada ORDER_CREATED DONE (N+1, lento con outbox grandes).
   const result = await query(
-    `SELECT client_uuid, tipo, estado, odoo_ref, retry_count, error_msg, updated_at
-     FROM outbox WHERE client_uuid = ANY($1) AND vendedor_id = $2`,
-    [uuidList, vendedor_id]
+    `SELECT o.client_uuid, o.tipo, o.estado, o.odoo_ref, o.retry_count,
+            o.error_msg, o.updated_at, voc.payload AS order_payload
+       FROM outbox o
+       LEFT JOIN LATERAL (
+         SELECT payload FROM vendor_orders_cache
+          WHERE o.tipo = 'ORDER_CREATED' AND o.estado = 'DONE'
+            AND vendor_uuid = $3 AND client_order_ref = o.client_uuid::text
+          LIMIT 1
+       ) voc ON true
+      WHERE o.client_uuid = ANY($1) AND o.vendedor_id = $2`,
+    [uuidList, vendedor_id, vendorNexusUuid]
   )
 
-  const events = []
-  for (const row of result.rows) {
-    const event = { ...row }
-
-    if (event.tipo === 'ORDER_CREATED' && event.estado === 'DONE') {
-      try {
-        const cachedOrder = await query(
-          `SELECT payload
-             FROM vendor_orders_cache
-            WHERE vendor_uuid = $1 AND client_order_ref = $2
-            LIMIT 1`,
-          [vendorNexusUuid, event.client_uuid]
-        )
-        const order = cachedOrder.rows[0]?.payload
-        if (order) {
-          event.estado = order.state || event.estado
-          event.odoo_ref = order.name || event.odoo_ref
-          event.odoo_order_id = order.id || null
-        }
-      } catch (err) {
-        fastify.log.error(`[SYNC_STATUS] ${event.client_uuid}: no se pudo leer cache de pedido: ${err.message}`)
-      }
+  const events = result.rows.map((row) => {
+    const { order_payload: order, ...event } = row
+    if (order && event.tipo === 'ORDER_CREATED' && event.estado === 'DONE') {
+      event.estado = order.state || event.estado
+      event.odoo_ref = order.name || event.odoo_ref
+      event.odoo_order_id = order.id || null
     }
-
-    events.push(event)
-  }
+    return event
+  })
 
   return { status: 'ok', events }
 })
@@ -1967,10 +2071,12 @@ fastify.get('/api/v1/supervisor/team/locations', { preHandler: [verifyToken] }, 
     'SELECT id, uuid, nombre, zona FROM vendedores WHERE activo = true'
   )
 
-  // Leer ubicaciones desde Redis en paralelo
-  const locations = await Promise.all(
-    vendedores.rows.map(async (v) => {
-      const raw = await redis.get(`location:${v.id}`)
+  // Una sola llamada MGET en vez de un GET por vendedor
+  const raws = vendedores.rows.length
+    ? await redis.mget(vendedores.rows.map((v) => `location:${v.id}`))
+    : []
+  const locations = vendedores.rows.map((v, i) => {
+      const raw = raws[i]
       const loc = raw ? JSON.parse(raw) : null
       return {
         vendedor_id: v.id,
@@ -1987,7 +2093,6 @@ fastify.get('/api/v1/supervisor/team/locations', { preHandler: [verifyToken] }, 
           : null
       }
     })
-  )
 
   const con_senal = locations.filter(l => l.lat !== null).length
 
