@@ -1121,6 +1121,105 @@ fastify.get('/api/v1/clients/:id/invoices', { preHandler: [verifyToken] }, async
   }
 })
 
+// ── ETIQUETAS DE FACTURA (proxy a Odoo, sin cache) ──────────────────────────
+//
+// Lista de account.move.tags para el desplegable de la pestaña "Etiquetas"
+// de la app. Online y sin cache (lista chica que se pide al abrir la pestaña),
+// igual que /exchange_rate. Si más adelante crece, se puede cachear como los
+// diarios (tabla payment_journals + cron sync_payment_journals).
+
+fastify.get('/api/v1/account_move_tags', { preHandler: [verifyToken] }, async (request, reply) => {
+  try {
+    const result = await odooPost('/nexus/api/v1/account_move_tags', {})
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    return {
+      status: 'ok',
+      count:  result?.count || 0,
+      tags:   result?.tags || [],
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /account_move_tags] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar etiquetas en Odoo' })
+  }
+})
+
+// ── COMPROMISOS DE PAGO (online, escribe fecha/monto en la factura) ─────────
+//
+// Reutiliza las facturas deudoras de /clients/:id/invoices. El vendedor llega
+// de la sesión (no del body), igual que en /payment_requests.
+
+fastify.post('/api/v1/invoice_commitments', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid: vendorNexusUuid } = request.user
+  const body = request.body || {}
+
+  if (!Array.isArray(body.lines) || !body.lines.length) {
+    return reply.code(400).send({ error: 'lines debe ser un array no vacío' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/set_invoice_commitments', {
+      vendor_nexus_uuid: vendorNexusUuid,
+      company_id:        body.company_id || null,
+      lines:             body.lines,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    fastify.log.info(
+      `[COMMITMENTS] ${result.updated} facturas actualizadas ` +
+      `vendor=${vendorNexusUuid?.slice(0, 8)}`
+    )
+    return {
+      status:  'ok',
+      updated: result.updated || 0,
+      ids:     result.ids || [],
+      errors:  result.errors || [],
+    }
+  } catch (err) {
+    const detail = (err && err.message) ? String(err.message) : 'Error desconocido'
+    fastify.log.error(`[POST /invoice_commitments] Odoo error: ${detail}`)
+    return reply.code(502).send({ error: `Odoo rechazó el compromiso: ${detail}` })
+  }
+})
+
+// ── ETIQUETAS POR FACTURA (online, escribe tag_ids en la factura) ───────────
+
+fastify.post('/api/v1/invoice_tags', { preHandler: [verifyToken] }, async (request, reply) => {
+  const { uuid: vendorNexusUuid } = request.user
+  const body = request.body || {}
+
+  if (!Array.isArray(body.lines) || !body.lines.length) {
+    return reply.code(400).send({ error: 'lines debe ser un array no vacío' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/set_invoice_tags', {
+      vendor_nexus_uuid: vendorNexusUuid,
+      company_id:        body.company_id || null,
+      lines:             body.lines,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    fastify.log.info(
+      `[TAGS] ${result.updated} facturas etiquetadas ` +
+      `vendor=${vendorNexusUuid?.slice(0, 8)}`
+    )
+    return {
+      status:  'ok',
+      updated: result.updated || 0,
+      ids:     result.ids || [],
+      errors:  result.errors || [],
+    }
+  } catch (err) {
+    const detail = (err && err.message) ? String(err.message) : 'Error desconocido'
+    fastify.log.error(`[POST /invoice_tags] Odoo error: ${detail}`)
+    return reply.code(502).send({ error: `Odoo rechazó las etiquetas: ${detail}` })
+  }
+})
+
 // ── SOLICITUDES DE PAGO (online, sin outbox por ahora) ──────────────────────
 
 fastify.post('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (request, reply) => {
