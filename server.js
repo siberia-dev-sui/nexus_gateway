@@ -1452,6 +1452,35 @@ fastify.get('/api/v1/payment_requests', { preHandler: [verifyToken] }, async (re
   }
 })
 
+// ── DETALLE DE UNA SOLICITUD DE PAGO (cabecera + líneas por factura) ────────
+//
+// La app lo pide al tocar una solicitud (en pendientes o en Mis solicitudes).
+// El :id es el account.payment.request.id.
+
+fastify.get('/api/v1/payment_requests/:id', { preHandler: [verifyToken] }, async (request, reply) => {
+  const paymentRequestId = parseInt(request.params.id, 10)
+  if (!paymentRequestId || Number.isNaN(paymentRequestId)) {
+    return reply.code(400).send({ error: 'payment_request_id (en la URL) inválido' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/payment_request_detail', {
+      payment_request_id: paymentRequestId,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    return {
+      status:  'ok',
+      request: result?.request || null,
+      lines:   result?.lines || [],
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /payment_requests/${paymentRequestId}] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar el detalle en Odoo' })
+  }
+})
+
 // ── SYNC MANUAL DE CLIENTES (trigger desde la app) ───────────────────────────
 
 fastify.post('/api/v1/clients/sync', { preHandler: [verifyToken] }, async (request, reply) => {
