@@ -1225,6 +1225,42 @@ fastify.get('/api/v1/clients/:id/invoices', { preHandler: [verifyToken] }, async
   }
 })
 
+// ── SOLICITUDES DE PAGO PENDIENTES DE UN CLIENTE (proxy a Odoo, sin cache) ───
+//
+// Devuelve las solicitudes de pago NO aprobadas ni canceladas de un cliente en
+// una empresa concreta. company_id es obligatorio: el mismo cliente puede
+// existir en varias empresas y solo deben verse las de la empresa activa.
+
+fastify.get('/api/v1/clients/:id/payment_requests', { preHandler: [verifyToken] }, async (request, reply) => {
+  const partnerId = parseInt(request.params.id, 10)
+  const companyId = parseInt(request.query.company_id, 10)
+
+  if (!partnerId || Number.isNaN(partnerId)) {
+    return reply.code(400).send({ error: 'partner_id (en la URL) inválido' })
+  }
+  if (!companyId || Number.isNaN(companyId)) {
+    return reply.code(400).send({ error: 'company_id es requerido' })
+  }
+
+  try {
+    const result = await odooPost('/nexus/api/v1/partner_payment_requests', {
+      partner_id: partnerId,
+      company_id: companyId,
+    })
+    if (result?.error) {
+      return reply.code(400).send(result)
+    }
+    return {
+      status:   'ok',
+      count:    result?.count || 0,
+      requests: result?.requests || [],
+    }
+  } catch (err) {
+    fastify.log.error(`[GET /clients/${partnerId}/payment_requests] Error: ${err.message}`)
+    return reply.code(502).send({ error: 'No se pudo consultar solicitudes en Odoo' })
+  }
+})
+
 // ── ETIQUETAS DE FACTURA (proxy a Odoo, sin cache) ──────────────────────────
 //
 // Lista de account.move.tags para el desplegable de la pestaña "Etiquetas"
